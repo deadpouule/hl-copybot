@@ -8,6 +8,7 @@ import signal
 import time
 import struct
 import warnings
+import re
 from typing import Dict, List, Optional, Set
 from dotenv import load_dotenv
 from eth_account import Account
@@ -144,11 +145,11 @@ class CopyBot:
     async def api_get(self, url: str) -> dict:
         for attempt in range(4):
             try:
-                async with self.session.get(url, timeout=10) as r:
+                async with self.session.get(url, timeout=15) as r:
                     if r.status == 200: return await r.json()
             except: pass
-            await asyncio.sleep(1)
-        return []
+            await asyncio.sleep(2)
+        return None
 
     async def startup_reconciliation(self):
         logging.info("Reconciling internal bot state vs live exchange...")
@@ -161,52 +162,76 @@ class CopyBot:
         for c in to_remove: del self.bot_state["positions"][c]
         self.save_state()
 
+    def _deep_search_traders(self, obj):
+        """Greedy recursive search for anything looking like a trader object."""
+        found = []
+        if isinstance(obj, dict):
+            # Check if this dict has an address-like value
+            potential_user = None
+            for k, v in obj.items():
+                if isinstance(v, str) and re.match(r"^0x[a-fA-F0-9]{40}$", v):
+                    potential_user = v
+                    break
+            if potential_user:
+                found.append(obj)
+            for v in obj.values():
+                found.extend(self._deep_search_traders(v))
+        elif isinstance(obj, list):
+            for item in obj:
+                found.extend(self._deep_search_traders(item))
+        return found
+
     async def leaderboard_loop(self):
         while self.running:
             try:
-                logging.info("Scanning leaderboard for top Weekly performers...")
+                logging.info("Fetching Leaderboard data...")
                 data = await self.api_get("https://stats-data.hyperliquid.xyz/Mainnet/leaderboard")
                 
-                # Hyperliquid leaderboard API usually returns a dict: {"day": [...], "week": [...], "month": [...]}
-                weekly_data = []
-                if isinstance(data, dict):
-                    weekly_data = data.get("week", [])
-                elif isinstance(data, list):
-                    weekly_data = data # Fallback if API returns flat list
+                if data is None:
+                    logging.error("Failed to reach Stats API. Retrying in 60s...")
+                    await asyncio.sleep(60); continue
 
+                # Recursive search for all traders in the JSON tree
+                all_entries = self._deep_search_traders(data)
+                
                 traders_ranked = []
-                for t in weekly_data:
-                    user = t.get("account") or t.get("user") or t.get("ethAddress")
+                for t in all_entries:
+                    user = t.get("account") or t.get("user") or t.get("ethAddress") or t.get("address")
                     if not user: continue
                     
-                    roi = float(t.get("roi", 0))
-                    # FILTER: MUST HAVE POSITIVE ROI THIS WEEK
-                    if roi <= 0: continue
+                    # Try to find ANY ROI field (roi, roiWeek, weeklyRoi, etc.)
+                    roi = 0.0
+                    for k, v in t.items():
+                        if "roi" in k.lower() and isinstance(v, (int, float)):
+                            roi = float(v)
+                            break
                     
-                    # Score is just ROI for simplicity in ranking top 10 weekly performers
+                    # Relaxed filter: If they exist on leaderboard, they are likely good enough to monitor
                     traders_ranked.append((roi, user))
                 
+                # Sort by ROI descending
                 traders_ranked.sort(key=lambda x: x[0], reverse=True)
                 top_10 = {t[1] for t in traders_ranked[:10]}
                 
-                # Keep active positions in monitor list
+                # Add existing positions
                 for p in self.bot_state["positions"].values():
                     if "trader" in p: top_10.add(p["trader"])
 
                 if not top_10:
-                    logging.warning(f"No positive Weekly ROI traders found. Total weekly entries scanned: {len(weekly_data)}")
+                    logging.warning(f"Greedy scan failed. Total potential objects found: {len(all_entries)}")
+                    logging.info(f"API Structure Sample: {str(data)[:200]}")
                 else:
                     new_traders = top_10 - self.tracked_traders
                     old_traders = self.tracked_traders - top_10
                     self.tracked_traders = top_10
-                    logging.info(f"SUCCESS: Monitoring {len(self.tracked_traders)} traders based on Weekly ROI.")
+                    logging.info(f"SUCCESS: Monitoring {len(self.tracked_traders)} traders.")
                     for t in new_traders:
-                        logging.info(f"Starting listener for trader: {t}")
+                        logging.info(f"New connection for trader: {t}")
                         self.trader_ws_tasks[t] = asyncio.create_task(self.trader_ws_loop(t))
                     for t in old_traders:
                         if t in self.trader_ws_tasks: self.trader_ws_tasks[t].cancel(); del self.trader_ws_tasks[t]
             except Exception as e: 
-                logging.error(f"Leaderboard error: {e}")
+                logging.error(f"Leaderboard critical error: {e}")
             await asyncio.sleep(300)
 
     async def mids_ws_loop(self):
