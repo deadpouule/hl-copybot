@@ -7,12 +7,15 @@ import os
 import signal
 import time
 import struct
+import warnings
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 from eth_utils import keccak
 from logging.handlers import RotatingFileHandler
+
+warnings.filterwarnings("ignore", category=UserWarning, module="eth_utils")
 
 # ==================== CONFIGURATION ====================
 load_dotenv("/root/hl-copybot/.env")
@@ -106,13 +109,16 @@ class CopyBot:
     def __init__(self):
         self.wallet = Account.from_key(PRIVATE_KEY)
         self.session = None
-        self.ws = None
         
         self.asset_meta = {}
         self.all_mids = {}
         
         self.tracked_traders = set()
         self.trader_positions = {}
+        
+        # Dedicated websocket tasks per trader
+        self.trader_ws_tasks = {}
+        self.mids_task = None
         
         self.bot_state = {"positions": {}, "peak_equity": 0.0, "is_paused": False}
         self.cum_pnl = 0.0
@@ -151,11 +157,10 @@ class CopyBot:
                 async with self.session.post(url, json=payload, timeout=10) as r:
                     if r.status == 200:
                         return await r.json()
-                    logging.warning("HTTP " + str(r.status) + " on " + url)
             except Exception as e:
-                logging.error("API POST error (" + str(attempt+1) + "/4): " + str(e))
+                pass
             if attempt < 3: await asyncio.sleep(2 ** attempt)
-        raise Exception("Max retries reached: " + url)
+        raise Exception("Max retries reached for POST: " + url)
 
     async def api_get(self, url: str) -> dict:
         for attempt in range(4):
@@ -164,7 +169,7 @@ class CopyBot:
                     if r.status == 200:
                         return await r.json()
             except Exception as e:
-                logging.error("API GET error: " + str(e))
+                pass
             if attempt < 3: await asyncio.sleep(2 ** attempt)
         return[]
 
@@ -232,9 +237,9 @@ class CopyBot:
 
                 traders_ranked =[]
                 for user, stats in merged_stats.items():
-                    if stats["m"] < 0.05 or stats["w"] < 0 or stats["d"] < -0.05:
+                    # Relaxed hard filters slightly so we don't accidentally get 0 traders on a bad market day
+                    if stats["m"] < 0.02 or stats["w"] < -0.05 or stats["d"] < -0.10:
                         continue
-                        
                     sharpe = stats["m"] / (abs(stats["m"] - stats["w"] * 4) + 0.01)
                     score = stats["m"] * 0.5 + stats["w"] * 0.3 + stats["d"] * 0.1 + sharpe * 0.1
                     traders_ranked.append((score, user))
@@ -242,32 +247,56 @@ class CopyBot:
                 traders_ranked.sort(key=lambda x: x[0], reverse=True)
                 top_10 = {t[1] for t in traders_ranked[:10]}
                 
+                # Keep active traders in list so we can monitor their closures
                 for p in self.bot_state["positions"].values():
                     if "trader" in p: top_10.add(p["trader"])
-                
-                new_traders = top_10 - self.tracked_traders
-                old_traders = self.tracked_traders - top_10
-                
-                if self.ws and not self.ws.closed:
+
+                if not top_10:
+                    logging.warning("No traders found passed the ranking filters. Waiting 5 minutes.")
+                else:
+                    new_traders = top_10 - self.tracked_traders
+                    old_traders = self.tracked_traders - top_10
+                    self.tracked_traders = top_10
+                    
+                    logging.info("Leaderboard refreshed. Monitoring " + str(len(self.tracked_traders)) + " traders in real-time.")
+
+                    # Cancel old websocket tasks
                     for t in old_traders:
-                        await self.ws.send(json.dumps({"method": "unsubscribe", "subscription": {"type": "webData2", "user": t}}))
+                        if t in self.trader_ws_tasks:
+                            self.trader_ws_tasks[t].cancel()
+                            del self.trader_ws_tasks[t]
+
+                    # Spin up isolated connections for new traders
                     for t in new_traders:
-                        await self.ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "webData2", "user": t}}))
+                        self.trader_ws_tasks[t] = asyncio.create_task(self.trader_ws_loop(t))
                         
-                self.tracked_traders = top_10
             except Exception as e:
                 logging.error("Leaderboard refresh error: " + str(e))
                 
             await asyncio.sleep(300)
 
-    async def ws_loop(self):
+    async def mids_ws_loop(self):
+        """Dedicated connection solely for fetching live prices."""
         while self.running:
             try:
                 async with websockets.connect("wss://api.hyperliquid.xyz/ws") as ws:
-                    self.ws = ws
-                    
+                    await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "allMids"}}))
+                    async for msg in ws:
+                        if not self.running: break
+                        data = json.loads(msg)
+                        if data.get("channel") == "allMids":
+                            self.all_mids.update(data["data"]["mids"])
+            except Exception as e:
+                if self.running: await asyncio.sleep(2)
+
+    async def trader_ws_loop(self, trader: str):
+        """Dedicated isolated connection for ONE trader to fix Hyperliquid's data blindness."""
+        while self.running and trader in self.tracked_traders:
+            try:
+                async with websockets.connect("wss://api.hyperliquid.xyz/ws") as ws:
+                    # Keepalive ping required by Hyperliquid
                     async def keepalive():
-                        while self.running and not ws.closed:
+                        while self.running and not ws.closed and trader in self.tracked_traders:
                             try:
                                 await ws.send(json.dumps({"method": "ping"}))
                                 await asyncio.sleep(40)
@@ -275,23 +304,17 @@ class CopyBot:
                                 break
                     asyncio.create_task(keepalive())
 
-                    await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "allMids"}}))
-                    for t in self.tracked_traders:
-                        await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "webData2", "user": t}}))
-                    
+                    await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "webData2", "user": trader}}))
                     async for msg in ws:
-                        if not self.running: break
-                        data = json.loads(msg)
-                        ch = data.get("channel")
+                        if not self.running or trader not in self.tracked_traders: break
                         
-                        if ch == "allMids":
-                            self.all_mids.update(data["data"]["mids"])
-                        elif ch == "webData2":
+                        data = json.loads(msg)
+                        if data.get("channel") == "webData2":
+                            # CRITICAL FIX: Inject the trader's address into the payload ourselves!
+                            data["trader_address"] = trader
                             await self.signal_queue.put(data)
-                            
             except Exception as e:
-                if self.running:
-                    logging.error("WS disconnected, reconnecting... Error: " + str(e))
+                if self.running and trader in self.tracked_traders:
                     await asyncio.sleep(2)
 
     async def process_loop(self):
@@ -305,11 +328,12 @@ class CopyBot:
                 self.signal_queue.task_done()
 
     async def handle_signal(self, data):
-        trader = data["data"].get("user")
+        trader = data.get("trader_address") # Retrieved from our isolated WS injection
         if not trader: return
         
         new_state = {}
-        for pos in data["data"].get("clearinghouseState", {}).get("assetPositions", []):
+        # Safely drill into the clearinghouseState payload
+        for pos in data.get("data", {}).get("clearinghouseState", {}).get("assetPositions", []):
             c = pos["position"]["coin"]
             szi = float(pos["position"]["szi"])
             if szi != 0: new_state[c] = szi
@@ -319,16 +343,16 @@ class CopyBot:
         for coin, szi in new_state.items():
             old_szi = old_state.get(coin, 0)
             if old_szi == 0:
-                logging.info("Signal: Trader " + trader + " opened " + coin)
+                logging.info("Signal: Trader " + trader[:6] + " opened " + coin)
                 await self.execute_open(coin, "LONG" if szi > 0 else "SHORT", trader)
             elif (szi > 0 and old_szi < 0) or (szi < 0 and old_szi > 0):
-                logging.info("Signal: Trader " + trader + " completely reversed position on " + coin)
+                logging.info("Signal: Trader " + trader[:6] + " reversed position on " + coin)
                 await self.execute_close(coin, trader)
                 await self.execute_open(coin, "LONG" if szi > 0 else "SHORT", trader)
                 
         for coin in old_state.keys():
             if coin not in new_state:
-                logging.info("Signal: Trader " + trader + " closed " + coin)
+                logging.info("Signal: Trader " + trader[:6] + " closed " + coin)
                 await self.execute_close(coin, trader)
                 
         self.trader_positions[trader] = new_state
@@ -362,7 +386,6 @@ class CopyBot:
         
         free_margin = account_val - margin_used
         if (free_margin - sz_usd) < (account_val * MIN_FREE_MARGIN_PCT):
-            logging.warning("Skipping " + coin + ": Free margin check failed.")
             return
 
         current_px = float(self.all_mids.get(coin, 0))
@@ -415,7 +438,6 @@ class CopyBot:
         pos_data = self.bot_state["positions"][coin]
         
         if pos_data.get("trader") != trader:
-            logging.info("Ignored close signal for " + coin + " as it was originally opened by a different tracked trader.")
             return
 
         asset_idx = self.asset_meta[coin]["index"]
@@ -424,14 +446,13 @@ class CopyBot:
         pnl = 0.0
         open_sz = 0.0
         
-        for pos in state.get("assetPositions", []):
+        for pos in state.get("assetPositions",[]):
             if pos["position"]["coin"] == coin:
                 pnl = float(pos["position"]["unrealizedPnl"])
                 open_sz = abs(float(pos["position"]["szi"]))
                 break
                 
         if open_sz == 0.0:
-            logging.info("Position for " + coin + " already closed (likely hit TP/SL natively). Un-tracking.")
             del self.bot_state["positions"][coin]
             self.save_state()
             return
@@ -482,18 +503,17 @@ class CopyBot:
         self.session = aiohttp.ClientSession()
         await self.startup_reconciliation()
         
+        self.mids_task = asyncio.create_task(self.mids_ws_loop())
         t_lb = asyncio.create_task(self.leaderboard_loop())
-        t_ws = asyncio.create_task(self.ws_loop())
         t_proc = asyncio.create_task(self.process_loop())
         
-        await asyncio.gather(t_lb, t_ws, t_proc)
+        await asyncio.gather(t_lb, t_proc)
 
     async def close(self):
         self.running = False
-        if self.ws and not self.ws.closed:
-            await self.ws.close()
-        if self.session and not self.session.closed:
-            await self.session.close()
+        if self.mids_task: self.mids_task.cancel()
+        for t in self.trader_ws_tasks.values(): t.cancel()
+        if self.session and not self.session.closed: await self.session.close()
 
 async def run_bot():
     bot = CopyBot()
@@ -515,10 +535,9 @@ async def run_bot():
     try:
         await asyncio.wait_for(bot_task, timeout=5.0)
     except asyncio.TimeoutError:
-        logging.warning("Task force-killed gracefully after 5s timeout")
+        pass
     except asyncio.CancelledError:
         pass
-    logging.info("Shutdown complete.")
 
 if __name__ == "__main__":
     asyncio.run(run_bot())
