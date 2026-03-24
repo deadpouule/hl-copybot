@@ -43,7 +43,6 @@ logging.basicConfig(
 
 # ==================== MSGPACK & SIGNING ====================
 def mini_msgpack_packb(obj):
-    """Zero-dependency msgpack dict serialization for L1 hashes."""
     if obj is None: return b'\xc0'
     elif isinstance(obj, bool): return b'\xc3' if obj else b'\xc2'
     elif isinstance(obj, int):
@@ -162,55 +161,52 @@ class CopyBot:
         for c in to_remove: del self.bot_state["positions"][c]
         self.save_state()
 
-    def _extract_traders_safely(self, data, container):
-        if isinstance(data, list):
-            for item in data: self._extract_traders_safely(item, container)
-        elif isinstance(data, dict):
-            if "user" in data or "address" in data or "account" in data: container.append(data)
-            for val in data.values(): self._extract_traders_safely(val, container)
-
     async def leaderboard_loop(self):
         while self.running:
             try:
                 logging.info("Scanning leaderboard for top Weekly performers...")
                 data = await self.api_get("https://stats-data.hyperliquid.xyz/Mainnet/leaderboard")
-                raw_traders = []; self._extract_traders_safely(data, raw_traders)
-                merged_stats = {}
-                for t in raw_traders:
-                    user = t.get("user") or t.get("address") or t.get("account")
-                    if not user: continue
-                    if user not in merged_stats: merged_stats[user] = {"m": 0.0, "w": 0.0, "d": 0.0}
-                    merged_stats[user]["m"] = float(t.get("roiMonth", t.get("monthlyRoi", merged_stats[user]["m"])))
-                    merged_stats[user]["w"] = float(t.get("roiWeek", t.get("weeklyRoi", merged_stats[user]["w"])))
-                    merged_stats[user]["d"] = float(t.get("roiDay", t.get("dailyRoi", merged_stats[user]["d"])))
+                
+                # Hyperliquid leaderboard API usually returns a dict: {"day": [...], "week": [...], "month": [...]}
+                weekly_data = []
+                if isinstance(data, dict):
+                    weekly_data = data.get("week", [])
+                elif isinstance(data, list):
+                    weekly_data = data # Fallback if API returns flat list
 
                 traders_ranked = []
-                for user, s in merged_stats.items():
-                    # FILTER: MUST HAVE POSITIVE WEEKLY ROI
-                    if s["w"] <= 0 or s["d"] < -0.15: continue
-                    sharpe = s["w"] / (abs(s["w"] - s["d"] * 7) + 0.01)
-                    # SCORE: Weekly (60%) + Daily (20%) + Monthly (10%) + Sharpe (10%)
-                    score = s["w"] * 0.6 + s["d"] * 0.2 + s["m"] * 0.1 + sharpe * 0.1
-                    traders_ranked.append((score, user))
+                for t in weekly_data:
+                    user = t.get("account") or t.get("user") or t.get("ethAddress")
+                    if not user: continue
+                    
+                    roi = float(t.get("roi", 0))
+                    # FILTER: MUST HAVE POSITIVE ROI THIS WEEK
+                    if roi <= 0: continue
+                    
+                    # Score is just ROI for simplicity in ranking top 10 weekly performers
+                    traders_ranked.append((roi, user))
                 
                 traders_ranked.sort(key=lambda x: x[0], reverse=True)
                 top_10 = {t[1] for t in traders_ranked[:10]}
+                
+                # Keep active positions in monitor list
                 for p in self.bot_state["positions"].values():
                     if "trader" in p: top_10.add(p["trader"])
 
                 if not top_10:
-                    logging.warning("No traders found with positive Weekly ROI. Scan count: " + str(len(merged_stats)))
+                    logging.warning(f"No positive Weekly ROI traders found. Total weekly entries scanned: {len(weekly_data)}")
                 else:
                     new_traders = top_10 - self.tracked_traders
                     old_traders = self.tracked_traders - top_10
                     self.tracked_traders = top_10
-                    logging.info("SUCCESS: Monitoring " + str(len(self.tracked_traders)) + " traders based on Weekly ROI.")
+                    logging.info(f"SUCCESS: Monitoring {len(self.tracked_traders)} traders based on Weekly ROI.")
                     for t in new_traders:
-                        logging.info("New connection for trader: " + str(t))
+                        logging.info(f"Starting listener for trader: {t}")
                         self.trader_ws_tasks[t] = asyncio.create_task(self.trader_ws_loop(t))
                     for t in old_traders:
                         if t in self.trader_ws_tasks: self.trader_ws_tasks[t].cancel(); del self.trader_ws_tasks[t]
-            except Exception as e: logging.error("Leaderboard error: " + str(e))
+            except Exception as e: 
+                logging.error(f"Leaderboard error: {e}")
             await asyncio.sleep(300)
 
     async def mids_ws_loop(self):
