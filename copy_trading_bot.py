@@ -1,28 +1,44 @@
-import asyncio, aiohttp, websockets, json, logging, os, signal, time, warnings, re
+import asyncio, aiohttp, websockets, json, logging, os, signal, time, struct, warnings, re, sys
 from typing import Dict, List, Optional, Set
 from dotenv import load_dotenv
 from eth_account import Account
 from eth_utils import keccak
 from logging.handlers import RotatingFileHandler
 
-# --- SAFE IMPORT BLOCK ---
+# --- BULLETPROOF NADO IMPORT BLOCK ---
+# This block tries every possible internal path for the Nado SDK
+NADO_FOUND = False
+
+# Path 1: Standard 'nado'
 try:
     from nado import NadoClient
+    NADO_FOUND = True
 except ImportError:
+    # Path 2: 'nado_protocol' (with underscore)
     try:
         from nado_protocol import NadoClient
+        NADO_FOUND = True
     except ImportError:
+        # Path 3: 'nado_protocol.client' (common in v0.3.5)
         try:
             from nado_protocol.client import NadoClient
+            NADO_FOUND = True
         except ImportError:
-            raise ImportError("Could not find NadoClient in any known paths (nado, nado_protocol, nado_protocol.client). Please check your installation.")
+            # Path 4: 'nado.client'
+            try:
+                from nado.client import NadoClient
+                NADO_FOUND = True
+            except ImportError:
+                pass
+
+if not NADO_FOUND:
+    raise ImportError("CRITICAL: NadoClient class not found. Please run the grep command provided by the developer to find the correct path.")
 
 # Suppress harmless network warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="eth_utils")
 
 # ==================== CONFIGURATION ====================
 load_dotenv("/root/hl-copybot/.env")
-HL_REF_ADDRESS = os.getenv("HL_WALLET_ADDRESS")
 NADO_PK = os.getenv("NADO_PRIVATE_KEY")
 NADO_ID = os.getenv("NADO_ACCOUNT_ID")
 
@@ -37,6 +53,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 class CrossExchangeBot:
     def __init__(self):
+        # Initialize the client
         self.nado = NadoClient(private_key=NADO_PK, account_id=NADO_ID)
         self.session = None; self.tracked_traders = set(); self.trader_positions = {}; self.trader_ws_tasks = {}
         self.bot_state = {"positions": {}}; self.signal_queue = asyncio.Queue(); self.running = False
@@ -61,9 +78,9 @@ class CrossExchangeBot:
                 if data:
                     raw = []; self._extract(data, raw)
                     ranked = sorted([(float(t.get("roiWeek", 0)), t.get("account") or t.get("user")) for t in raw if (t.get("account") or t.get("user"))], key=lambda x: x[0], reverse=True)
-                    top_selected = {t[1] for t in ranked[:TOP_X_TRADERS]}
-                    new = top_selected - self.tracked_traders; old = self.tracked_traders - top_selected
-                    self.tracked_traders = top_selected
+                    top = {t[1] for t in ranked[:TOP_X_TRADERS]}
+                    new = top - self.tracked_traders; old = self.tracked_traders - top
+                    self.tracked_traders = top
                     for t in new:
                         logging.info(f"Connected to HL Pro: {t}")
                         self.trader_ws_tasks[t] = asyncio.create_task(self.trader_ws_loop(t))
@@ -80,7 +97,6 @@ class CrossExchangeBot:
                 async with websockets.connect(uri) as ws:
                     await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "webData2", "user": trader}}))
                     async for msg in ws:
-                        if not self.running or trader not in self.tracked_traders: break
                         data = json.loads(msg)
                         if data.get("channel") == "webData2":
                             data["trader_address"] = trader; await self.signal_queue.put(data)
@@ -97,17 +113,17 @@ class CrossExchangeBot:
                 for coin, szi in new_state.items():
                     if coin not in old_state:
                         if coin in ALLOWED_COINS:
-                            logging.info(f"SIGNAL: {trader[:6]} opened {coin}. Executing on Nado...")
+                            logging.info(f"SIGNAL: {trader[:6]} opened {coin}. Mirroring to Nado...")
                             await self.execute_nado_open(coin, "BUY" if szi > 0 else "SELL", trader)
                 for coin in old_state.keys():
                     if coin not in new_state: await self.execute_nado_close(coin, trader)
                 self.trader_positions[trader] = new_state
-            except Exception as e: logging.error(f"Signal processing error: {e}")
             finally: self.signal_queue.task_done()
 
     async def execute_nado_open(self, coin: str, side: str, trader: str):
         if coin in self.bot_state["positions"]: return
         try:
+            # Wrap SDK call to prevent blocking
             res_info = await asyncio.to_thread(self.nado.get_account_info)
             if not res_info.success: return
             usdc_bal = 0.0
@@ -120,7 +136,6 @@ class CrossExchangeBot:
             if res_order.success:
                 logging.info(f"NADO MIRROR SUCCESS: {coin}")
                 self.bot_state["positions"][coin] = {"trader": trader, "side": side}
-            else: logging.error(f"NADO ORDER REJECTED: {res_order.message}")
         except Exception as e: logging.error(f"Nado Open Exception: {e}")
 
     async def execute_nado_close(self, coin: str, trader: str):
@@ -129,7 +144,6 @@ class CrossExchangeBot:
             symbol = f"PERP_{coin}_USDC"; close_side = "SELL" if self.bot_state["positions"][coin]["side"] == "BUY" else "BUY"
             res_close = await asyncio.to_thread(self.nado.create_order, symbol=symbol, order_type="MARKET", side=close_side, reduce_only=True)
             if res_close.success: logging.info(f"NADO CLOSE SUCCESS: {coin}"); del self.bot_state["positions"][coin]
-            else: logging.error(f"NADO CLOSE FAILED: {res_close.message}")
         except Exception as e: logging.error(f"Nado Close Exception: {e}")
 
     async def run(self):
