@@ -46,10 +46,6 @@ class CrossExchangeBot:
         try: self.nado.private_key = NADO_PK
         except: pass
         
-        # --- AUTO-DISCOVERY ---
-        methods = [m for m in dir(self.nado) if not m.startswith('_')]
-        logging.info(f"SDK Discovery - Available Nado methods: {methods}")
-        
         self.session = None
         self.tracked_traders = set()
         self.trader_positions = {}
@@ -86,8 +82,7 @@ class CrossExchangeBot:
                         for k, v in t.items():
                             if "roi" in k.lower() and isinstance(v, (int, float)):
                                 roi = float(v); break
-                        if addr not in processed or roi > processed[addr]:
-                            processed[addr] = roi
+                        if addr not in processed or roi > processed[addr]: processed[addr] = roi
                     ranked = sorted(processed.items(), key=lambda x: x[1], reverse=True)
                     top_selected = {r[0] for r in ranked[:TOP_X_TRADERS]}
                     new = top_selected - self.tracked_traders; old = self.tracked_traders - top_selected
@@ -126,7 +121,7 @@ class CrossExchangeBot:
                 for coin, szi in new_state.items():
                     if coin not in old_state:
                         if coin.upper() in ALLOWED_COINS:
-                            logging.info(f"SIGNAL: {trader[:6]} opened {coin}. Executing on Nado...")
+                            logging.info(f"HL SIGNAL: {trader[:6]} opened {coin}. Executing on Nado...")
                             await self.execute_nado_open(coin, "BUY" if szi > 0 else "SELL", trader)
                         else: logging.info(f"Ignoring non-major: {coin}")
                 for coin in old_state.keys():
@@ -136,21 +131,35 @@ class CrossExchangeBot:
             finally: self.signal_queue.task_done()
 
     async def _safe_get_balance(self):
-        for m_name in ['get_account', 'get_account_info', 'get_info', 'get_client_info']:
+        for m_name in ['get_account', 'get_account_info', 'get_info', 'get_client_info', 'get_holdings']:
             if hasattr(self.nado, m_name):
                 res = await asyncio.to_thread(getattr(self.nado, m_name))
-                if res.success:
-                    for h in res.data.get('holdings', []):
+                try:
+                    data = res.data if hasattr(res, 'data') else res
+                    holdings = data.get('holdings', [])
+                    for h in holdings:
                         if h.get('token') == 'USDC': return float(h.get('holding', 0))
+                except: continue
         return 0.0
 
-    async def _safe_execute_order(self, **params):
-        """Tries multiple method names for placing orders in different SDK versions."""
-        for m_name in ['create_order', 'place_order', 'submit_order', 'send_order']:
-            if hasattr(self.nado, m_name):
+    async def _smart_execute_order(self, **params):
+        """Greedy search for any order-related method in the SDK."""
+        # Common order method names in various nado-protocol versions
+        candidates = ['create_order', 'place_order', 'submit_order', 'send_order', 'post_order']
+        # If those fail, search for ANY method containing 'order'
+        all_methods = dir(self.nado)
+        for cand in candidates:
+            if cand in all_methods:
+                method = getattr(self.nado, cand)
+                return await asyncio.to_thread(method, **params)
+        
+        for m_name in all_methods:
+            if 'order' in m_name.lower() and not m_name.startswith('_') and callable(getattr(self.nado, m_name)):
+                logging.info(f"Smart-Discovery: Trying found method '{m_name}'")
                 method = getattr(self.nado, m_name)
                 return await asyncio.to_thread(method, **params)
-        raise AttributeError("SDK error: No order placement method found in NadoClient.")
+        
+        raise AttributeError("CRITICAL: No order placement method found in NadoClient.")
 
     async def execute_nado_open(self, coin: str, side: str, trader: str):
         if coin in self.bot_state["positions"]: return
@@ -158,16 +167,17 @@ class CrossExchangeBot:
             usdc_bal = await self._safe_get_balance()
             order_amt = max(usdc_bal * RISK_POS_PCT, MIN_ORDER_USD)
             symbol = f"PERP_{coin.upper()}_USDC"
-            
             logging.info(f"NADO ORDER: {side} {symbol} Amount: ${order_amt:.2f}")
-            res = await self._safe_execute_order(
+            res = await self._smart_execute_order(
                 symbol=symbol, order_type="MARKET", side=side, order_amount=order_amt
             )
-            
-            if res.success:
+            success = res.success if hasattr(res, 'success') else res.get('success')
+            if success:
                 logging.info(f"NADO SUCCESS: Open {coin}")
                 self.bot_state["positions"][coin] = {"trader": trader, "side": side}
-            else: logging.error(f"NADO REJECTED: {res.message}")
+            else:
+                msg = res.message if hasattr(res, 'message') else str(res)
+                logging.error(f"NADO REJECTED: {msg}")
         except Exception as e: logging.error(f"Nado Open Ex: {e}")
 
     async def execute_nado_close(self, coin: str, trader: str):
@@ -176,17 +186,18 @@ class CrossExchangeBot:
             symbol = f"PERP_{coin.upper()}_USDC"
             close_side = "SELL" if self.bot_state["positions"][coin]["side"] == "BUY" else "BUY"
             logging.info(f"NADO ORDER: Close {symbol}")
-            res = await self._safe_execute_order(
+            res = await self._smart_execute_order(
                 symbol=symbol, order_type="MARKET", side=close_side, reduce_only=True
             )
-            if res.success:
+            success = res.success if hasattr(res, 'success') else res.get('success')
+            if success:
                 logging.info(f"NADO SUCCESS: Close {coin}")
                 del self.bot_state["positions"][coin]
         except Exception as e: logging.error(f"Nado Close Ex: {e}")
 
     async def run(self):
         self.running = True; self.session = aiohttp.ClientSession()
-        logging.info("Bot Live. Monitoring HL Traders for Majors...")
+        logging.info("Bot Live. Monitoring HL Pro Traders...")
         asyncio.create_task(self.leaderboard_loop())
         await self.process_loop()
 
