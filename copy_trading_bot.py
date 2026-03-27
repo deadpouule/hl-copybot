@@ -16,24 +16,16 @@ except ImportError:
     try:
         from nado_protocol import NadoClient
     except ImportError:
-        try:
-            from nado_protocol.client import NadoClient
-        except ImportError:
-            raise ImportError("CRITICAL: NadoClient class not found. Ensure nado-protocol is installed.")
+        from nado_protocol.client import NadoClient
 
 # Suppress harmless network warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="eth_utils")
 
 # ==================== CONFIGURATION ====================
 load_dotenv("/root/hl-copybot/.env")
-# Hyperliquid (Source)
-HL_REF_ADDRESS = os.getenv("HL_WALLET_ADDRESS")
-
-# Nado (Execution)
 NADO_PK = os.getenv("NADO_PRIVATE_KEY")
 NADO_ID = os.getenv("NADO_ACCOUNT_ID")
 
-# Inject Private Key into Environment (Required by some SDK versions)
 if NADO_PK:
     os.environ["NADO_PRIVATE_KEY"] = NADO_PK
     os.environ["ORDERLY_PRIVATE_KEY"] = NADO_PK
@@ -49,17 +41,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 class CrossExchangeBot:
     def __init__(self):
-        # FIX: The SDK version 0.3.5 takes only 1 positional argument (Account ID)
-        # We initialize with the ID and then manually attach the key.
-        logging.info(f"Initializing Nado Client for Account: {NADO_ID}")
+        logging.info(f"Initializing Nado Client for: {NADO_ID}")
         self.nado = NadoClient(NADO_ID)
-        
-        # Manually attach the private key to the client object
-        try:
-            self.nado.private_key = NADO_PK
-        except:
-            pass
-            
+        try: self.nado.private_key = NADO_PK
+        except: pass
         self.session = None
         self.tracked_traders = set()
         self.trader_positions = {}
@@ -73,31 +58,57 @@ class CrossExchangeBot:
             if r.status == 200: return await r.json()
         return None
 
-    def _extract(self, obj, container):
+    def _extract_all(self, obj, container):
+        """Greedy extraction of all objects that look like traders."""
         if isinstance(obj, dict):
-            if any(k in obj for k in ["account", "user", "ethAddress"]) and any("roi" in k.lower() for k in obj): container.append(obj)
-            for v in obj.values(): self._extract(v, container)
+            user = obj.get("account") or obj.get("user") or obj.get("ethAddress")
+            if user and re.match(r"^0x[a-fA-F0-9]{40}$", str(user)):
+                container.append(obj)
+            for v in obj.values(): self._extract_all(v, container)
         elif isinstance(obj, list):
-            for i in obj: self._extract(i, container)
+            for i in obj: self._extract_all(i, container)
 
     async def leaderboard_loop(self):
         while self.running:
             try:
-                logging.info(f"Scanning HL for Top {TOP_X_TRADERS} Weekly Traders...")
+                logging.info("Scanning HL Leaderboard...")
                 data = await self.api_get("https://stats-data.hyperliquid.xyz/Mainnet/leaderboard")
                 if data:
-                    raw = []; self._extract(data, raw)
-                    ranked = sorted([(float(t.get("roiWeek", 0)), t.get("account") or t.get("user")) for t in raw if (t.get("account") or t.get("user"))], key=lambda x: x[0], reverse=True)
-                    top_selected = {t[1] for t in ranked[:TOP_X_TRADERS]}
-                    new = top_selected - self.tracked_traders; old = self.tracked_traders - top_selected
+                    raw = []; self._extract_all(data, raw)
+                    
+                    # Deduplicate by address and grab ROI
+                    processed = {}
+                    for t in raw:
+                        addr = t.get("account") or t.get("user") or t.get("ethAddress")
+                        roi = 0.0
+                        for k, v in t.items():
+                            if "roi" in k.lower() and isinstance(v, (int, float)):
+                                roi = float(v); break
+                        if addr not in processed or roi > processed[addr]:
+                            processed[addr] = roi
+                    
+                    # Sort by ROI descending
+                    ranked = sorted(processed.items(), key=lambda x: x[1], reverse=True)
+                    top_selected = {r[0] for r in ranked[:TOP_X_TRADERS]}
+                    
+                    if not top_selected:
+                        logging.warning("Leaderboard scan returned no valid addresses.")
+                        await asyncio.sleep(60); continue
+
+                    new = top_selected - self.tracked_traders
+                    old = self.tracked_traders - top_selected
                     self.tracked_traders = top_selected
+                    
                     for t in new:
-                        logging.info(f"Connected to HL Pro: {t}")
+                        logging.info(f"Subscribing to HL Pro: {t}")
                         self.trader_ws_tasks[t] = asyncio.create_task(self.trader_ws_loop(t))
                     for t in old:
-                        if t in self.trader_ws_tasks: self.trader_ws_tasks[t].cancel(); del self.trader_ws_tasks[t]
+                        if t in self.trader_ws_tasks:
+                            self.trader_ws_tasks[t].cancel(); del self.trader_ws_tasks[t]
+                    
                     logging.info(f"Monitoring {len(self.tracked_traders)} traders.")
-            except Exception as e: logging.error(f"Leaderboard Loop Error: {e}")
+            except Exception as e:
+                logging.error(f"Leaderboard Loop Error: {e}")
             await asyncio.sleep(300)
 
     async def trader_ws_loop(self, trader: str):
@@ -107,7 +118,7 @@ class CrossExchangeBot:
                 async with websockets.connect(uri) as ws:
                     await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "webData2", "user": trader}}))
                     async for msg in ws:
-                        if not self.running: break
+                        if not self.running or trader not in self.tracked_traders: break
                         data = json.loads(msg)
                         if data.get("channel") == "webData2":
                             data["trader_address"] = trader; await self.signal_queue.put(data)
@@ -119,9 +130,8 @@ class CrossExchangeBot:
             data = await self.signal_queue.get()
             try:
                 trader = data.get("trader_address")
-                # Extract clearinghouse state correctly
-                raw_data = data.get("data", {}).get("clearinghouseState", {}).get("assetPositions", [])
-                new_state = {p["position"]["coin"]: float(p["position"]["szi"]) for p in raw_data if float(p["position"]["szi"]) != 0}
+                raw_positions = data.get("data", {}).get("clearinghouseState", {}).get("assetPositions", [])
+                new_state = {p["position"]["coin"]: float(p["position"]["szi"]) for p in raw_positions if float(p["position"]["szi"]) != 0}
                 
                 old_state = self.trader_positions.get(trader, {})
                 for coin, szi in new_state.items():
@@ -130,22 +140,18 @@ class CrossExchangeBot:
                             logging.info(f"SIGNAL: {trader[:6]} opened {coin}. Executing on Nado...")
                             await self.execute_nado_open(coin, "BUY" if szi > 0 else "SELL", trader)
                         else:
-                            logging.info(f"Ignoring non-major asset: {coin}")
+                            logging.info(f"Ignored non-major: {coin}")
                 for coin in old_state.keys():
                     if coin not in new_state: await self.execute_nado_close(coin, trader)
                 self.trader_positions[trader] = new_state
-            except Exception as e: logging.error(f"Process Loop Error: {e}")
+            except Exception as e: logging.error(f"Process Error: {e}")
             finally: self.signal_queue.task_done()
 
     async def execute_nado_open(self, coin: str, side: str, trader: str):
         if coin in self.bot_state["positions"]: return
         try:
-            # SDK Call wrapped in thread to keep loops running
             res_info = await asyncio.to_thread(self.nado.get_account_info)
-            if not res_info.success: 
-                logging.error(f"Nado info fetch failed: {res_info.message}")
-                return
-            
+            if not res_info.success: return
             usdc_bal = 0.0
             for h in res_info.data.get('holdings', []):
                 if h['token'] == 'USDC': usdc_bal = float(h['holding'])
@@ -154,32 +160,28 @@ class CrossExchangeBot:
             if order_amt < MIN_ORDER_USD: order_amt = MIN_ORDER_USD
             
             symbol = f"PERP_{coin}_USDC"
-            logging.info(f"NADO: Market {side} for {symbol} (${order_amt:.2f})")
-            
+            logging.info(f"NADO: Creating MARKET {side} for {symbol} (${order_amt:.2f})")
             res_order = await asyncio.to_thread(self.nado.create_order, symbol=symbol, order_type="MARKET", side=side, order_amount=order_amt)
             if res_order.success:
                 logging.info(f"NADO MIRROR SUCCESS: {coin}")
                 self.bot_state["positions"][coin] = {"trader": trader, "side": side}
-            else:
-                logging.error(f"NADO ORDER REJECTED: {res_order.message}")
-        except Exception as e: logging.error(f"Nado Open Exception: {e}")
+            else: logging.error(f"NADO REJECTED: {res_order.message}")
+        except Exception as e: logging.error(f"Nado Open Ex: {e}")
 
     async def execute_nado_close(self, coin: str, trader: str):
         if coin not in self.bot_state["positions"] or self.bot_state["positions"][coin]["trader"] != trader: return
         try:
             symbol = f"PERP_{coin}_USDC"
             close_side = "SELL" if self.bot_state["positions"][coin]["side"] == "BUY" else "BUY"
-            logging.info(f"NADO: Closing {symbol}...")
             res_close = await asyncio.to_thread(self.nado.create_order, symbol=symbol, order_type="MARKET", side=close_side, reduce_only=True)
             if res_close.success:
                 logging.info(f"NADO CLOSE SUCCESS: {coin}")
                 del self.bot_state["positions"][coin]
-            else: logging.error(f"NADO CLOSE FAILED: {res_close.message}")
-        except Exception as e: logging.error(f"Nado Close Exception: {e}")
+        except Exception as e: logging.error(f"Nado Close Ex: {e}")
 
     async def run(self):
         self.running = True; self.session = aiohttp.ClientSession()
-        logging.info("Cross-Exchange Bot Started. Searching HL Leaderboard...")
+        logging.info("Cross-Exchange Bot Live. Sourcing from HL...")
         asyncio.create_task(self.leaderboard_loop())
         await self.process_loop()
 
@@ -187,20 +189,10 @@ class CrossExchangeBot:
         self.running = False; await self.session.close()
 
 async def main():
-    bot = CrossExchangeBot()
-    loop = asyncio.get_running_loop()
-    stop = asyncio.Event()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop.set)
-    
-    bot_task = asyncio.create_task(bot.run())
-    await stop.wait()
-    logging.info("Shutdown signal received.")
-    await bot.close()
-    bot_task.cancel()
+    bot = CrossExchangeBot(); loop = asyncio.get_running_loop(); stop = asyncio.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM): loop.add_signal_handler(sig, stop.set)
+    t = asyncio.create_task(bot.run()); await stop.wait(); await bot.close(); t.cancel()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    try: asyncio.run(main())
+    except KeyboardInterrupt: pass
