@@ -147,7 +147,8 @@ class NadoQuantBot:
             try:
                 data = await self.api_get("https://stats-data.hyperliquid.xyz/Mainnet/leaderboard")
                 if data:
-                    raw =[]; self._extract_traders(data, raw)
+                    raw =[]
+                    self._extract_traders(data, raw)
                     processed = {}
                     for t in raw:
                         addr = t.get("account") or t.get("user") or t.get("ethAddress")
@@ -191,7 +192,7 @@ class NadoQuantBot:
             data = await self.signal_queue.get()
             try:
                 trader = data.get("trader_address")
-                raw_pos = data.get("data", {}).get("clearinghouseState", {}).get("assetPositions", [])
+                raw_pos = data.get("data", {}).get("clearinghouseState", {}).get("assetPositions",[])
                 new_state = {p["position"]["coin"]: float(p["position"]["szi"]) for p in raw_pos if float(p["position"]["szi"]) != 0}
                 
                 old_state = self.trader_positions.get(trader, {})
@@ -224,13 +225,13 @@ class NadoQuantBot:
         if not market: return
 
         try:
-            # 1. Fetch Proxy Price
+            # 1. Proxy Price via HL
             async with self.session.post("https://api.hyperliquid.xyz/info", json={"type": "allMids"}) as r:
                 mids = await r.json()
                 px = float(mids.get(coin.upper(), 0))
             if px == 0: return
 
-            # 2. Add 5% Slippage to guarantee execution
+            # 2. Add 5% Slippage to ensure Market fill, then ROUND EXACTLY to Orderly's rules
             target_px = px * (1.05 if is_buy else 0.95)
             if is_close:
                 is_buy = not self.bot_state["positions"][coin]["is_buy"]
@@ -238,7 +239,7 @@ class NadoQuantBot:
 
             final_px = self._round_step(target_px, market["p_tick"])
             
-            # 3. Use Official Margin Manager for True Balance
+            # 3. Use Official SDK Margin Manager to get exact available balance
             sub_info = await asyncio.to_thread(self.client.context.engine_client.get_subaccount_info, self.subaccount_hex)
             iso_res = await asyncio.to_thread(self.client.context.engine_client.get_isolated_positions, self.subaccount_hex)
             iso_pos = getattr(iso_res, 'isolated_positions',[])
@@ -250,22 +251,17 @@ class NadoQuantBot:
             usd_amt = max(available_margin * RISK_POS_PCT, MIN_ORDER_USD)
             
             if available_margin < usd_amt and not is_close:
-                logging.warning(f"Skipping {coin}: Insufficient Margin (Available: ${available_margin:.2f})")
+                logging.warning(f"Skipping {coin}: Free Margin ${available_margin:.2f} is too low.")
                 return
             
             qty = usd_amt / px
             final_qty = self._round_step(qty, market["s_tick"])
 
-            if final_qty <= 0 or final_qty < market["min_s"]:
-                logging.warning(f"Skipping {coin}: Computed qty {final_qty} is below Nado limit {market['min_s']}.")
-                return
-
-            # 4. FLAWLESS X18 EVM MATH
+            # 4. Construct EXACT X18 Values (Direct Math avoids 'to_x18' SDK bugs)
             appendix = build_appendix(order_type=OrderType.IOC, reduce_only=is_close)
-            
-            price_x18 = int((Decimal(str(final_px)) * Decimal("1e18")).to_integral_value())
-            amount_x18 = int((Decimal(str(final_qty)) * Decimal("1e18")).to_integral_value())
+            amount_x18 = int(round(final_qty * 1e18))
             if not is_buy: amount_x18 = -amount_x18
+            price_x18 = int(round(final_px * 1e18))
 
             order = OrderParams(
                 sender=SubaccountParams(subaccount_owner=self.owner, subaccount_name="default"),
@@ -276,7 +272,52 @@ class NadoQuantBot:
                 appendix=appendix
             )
 
-            logging.info(f"NADO EXECUTION: {coin} | Side: {'BUY' if is_buy else 'SELL'} | Px: {final_px} | Qty: {final_qty}")
+            logging.info(f"NADO EXECUTE: {coin} | Side: {'BUY' if is_buy else 'SELL'} | Px: {final_px} | Qty: {final_qty}")
             res = await asyncio.to_thread(self.client.market.place_order, PlaceOrderParams(product_id=market["id"], order=order))
             
-            success = getattr(res, '
+            # Safe success check
+            success = getattr(res, 'success', False)
+            if not success and isinstance(res, dict): success = res.get('success', False)
+            if not success and "success=true" in str(res).lower(): success = True
+
+            if success:
+                logging.info(f"NADO SUCCESS: {coin} Trade Complete!")
+                if is_close: 
+                    del self.bot_state["positions"][coin]
+                else: 
+                    self.bot_state["positions"][coin] = {"trader": trader, "is_buy": is_buy}
+                self.save_state()
+            else:
+                msg = getattr(res, 'message', str(res))
+                logging.error(f"NADO REJECTED: {msg}")
+
+        except Exception as e:
+            logging.error(f"Order Execution Failure: {e}")
+
+    async def run(self):
+        self.running = True; self.session = aiohttp.ClientSession()
+        
+        # This will safely loop until it gets the True IDs
+        await self.sync_market_data()
+
+        asyncio.create_task(self.leaderboard_loop())
+        await self.process_loop()
+
+    async def close(self):
+        self.running = False; await self.session.close()
+
+async def main():
+    bot = NadoQuantBot()
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+    def sig_h(): stop.set()
+    for s in (signal.SIGINT, signal.SIGTERM): loop.add_signal_handler(s, sig_h)
+    
+    t = asyncio.create_task(bot.run())
+    await stop.wait()
+    await bot.close()
+    t.cancel()
+
+if __name__ == "__main__":
+    try: asyncio.run(main())
+    except KeyboardInterrupt: pass
