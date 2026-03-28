@@ -12,8 +12,6 @@ from nado_protocol.utils.nonce import gen_order_nonce
 from nado_protocol.utils.subaccount import SubaccountParams
 from nado_protocol.utils.order import build_appendix
 from nado_protocol.utils.bytes32 import subaccount_to_hex
-
-# OFFICIAL SDK UTILITY: Bypasses manual balance parsing
 from nado_protocol.utils.margin_manager import MarginManager
 
 warnings.filterwarnings("ignore", category=UserWarning, module="eth_utils")
@@ -40,7 +38,7 @@ logging.basicConfig(
 
 class NadoQuantBot:
     def __init__(self):
-        logging.info("Initializing Ultimate Decimal-Safe Nado Engine...")
+        logging.info("Initializing Ultimate Precision Nado Engine...")
         self.client = create_nado_client(NADO_ENV, NADO_PK)
         self.owner = self.client.context.engine_client.signer.address
         self.subaccount_hex = subaccount_to_hex(self.owner, "default")
@@ -69,65 +67,67 @@ class NadoQuantBot:
         with open(self.state_file, "w") as f:
             json.dump(self.bot_state, f)
 
-    def _apply_fallback_markets(self):
-        """Hardcoded precision rules to ensure the bot NEVER freezes on startup."""
-        self.product_map.update({
-            "BTC": {"id": 1, "p_tick": 0.1, "s_tick": 0.0001},
-            "ETH": {"id": 2, "p_tick": 0.1, "s_tick": 0.001},
-            "SOL": {"id": 3, "p_tick": 0.001, "s_tick": 0.1},
-            "BNB": {"id": 4, "p_tick": 0.01, "s_tick": 0.01},
-            "HYPE": {"id": 100, "p_tick": 0.001, "s_tick": 1.0},
-            "PAX": {"id": 5, "p_tick": 0.1, "s_tick": 0.001}, 
-            "XAG": {"id": 6, "p_tick": 0.001, "s_tick": 1.0},
-            "WTI": {"id": 7, "p_tick": 0.01, "s_tick": 0.1}
-        })
-        logging.info("Market Sync: Applied robust default precision rules for Majors.")
+    def _search_products(self, obj):
+        """Recursively hunts through ANY data structure to find product rules."""
+        found =[]
+        if isinstance(obj, dict):
+            # Check if this object IS a product definition
+            if 'symbol' in obj and ('product_id' in obj or 'productId' in obj):
+                found.append(obj)
+            # Continue digging deeper
+            for v in obj.values():
+                found.extend(self._search_products(v))
+        elif isinstance(obj, (list, tuple, set)):
+            for i in obj:
+                found.extend(self._search_products(i))
+        elif hasattr(obj, '__dict__'):
+            found.extend(self._search_products(vars(obj)))
+        elif hasattr(obj, 'model_dump'):
+            found.extend(self._search_products(obj.model_dump()))
+        return found
 
     async def sync_market_data(self):
-        """Loads fallbacks instantly, then gently attempts to update from the SDK."""
-        self._apply_fallback_markets()
-        try:
-            res = await asyncio.to_thread(self.client.market.get_all_engine_markets)
-            
-            # Safely unwrap SDK data regardless of version/type
-            items =[]
-            if isinstance(res, dict): items = list(res.values())
-            elif hasattr(res, 'items'): items = list(res.values())
-            elif isinstance(res, list): items = res
-            elif hasattr(res, 'data'):
-                d = res.data
-                if isinstance(d, dict): items = list(d.values())
-                elif isinstance(d, list): items = d
-            
-            count = 0
-            for m in items:
-                # Unwrap Tuple objects (id, Data)
-                if isinstance(m, tuple) and len(m) == 2: m = m[1]
+        """Forces the bot to retrieve TRUE Product IDs and Tick Sizes from Orderly Engine."""
+        while self.running:
+            try:
+                logging.info("Downloading true Market IDs and Rules from Nado Engine...")
+                res = await asyncio.to_thread(self.client.market.get_all_engine_markets)
                 
-                m_dict = {}
-                if isinstance(m, dict): m_dict = m
-                elif hasattr(m, 'dict'): m_dict = m.dict()
-                elif hasattr(m, 'model_dump'): m_dict = m.model_dump()
-                elif hasattr(m, '__dict__'): m_dict = vars(m)
+                # Rip the products out of whatever container the SDK used
+                products = self._search_products(res)
                 
-                symbol = str(m_dict.get('symbol', ''))
-                if 'PERP_' in symbol:
-                    coin = symbol.split('_')[1]
-                    pid = m_dict.get('product_id') or m_dict.get('productId')
-                    
-                    if pid is not None:
-                        p_tick = m_dict.get('price_increment') or (float(m_dict.get('price_increment_x18', 0)) / 1e18)
-                        s_tick = m_dict.get('base_tick') or (float(m_dict.get('base_tick_x18', 0)) / 1e18)
+                count = 0
+                for p in products:
+                    symbol = str(p.get('symbol', ''))
+                    if 'PERP_' in symbol:
+                        coin = symbol.split('_')[1]
                         
-                        if p_tick and s_tick:
+                        pid = p.get('product_id')
+                        if pid is None: pid = p.get('productId')
+                        
+                        p_tick = p.get('price_increment') or (float(p.get('price_increment_x18', 0)) / 1e18)
+                        s_tick = p.get('base_tick') or (float(p.get('base_tick_x18', 0)) / 1e18)
+                        min_s = p.get('min_base_amount') or 0.0001
+                        
+                        if pid is not None and p_tick and s_tick:
                             self.product_map[coin] = {
-                                "id": int(pid), "p_tick": float(p_tick), "s_tick": float(s_tick)
+                                "id": int(pid),
+                                "p_tick": float(p_tick),
+                                "s_tick": float(s_tick),
+                                "min_s": float(min_s)
                             }
                             count += 1
-            if count > 0:
-                logging.info(f"Market Sync SUCCESS! {count} pairs confirmed from SDK.")
-        except Exception as e:
-            logging.warning(f"Live Market Sync skipped ({e}). Fallbacks are fully active.")
+                
+                if count > 0:
+                    logging.info(f"Market Sync SUCCESS! {count} true asset pairs mapped.")
+                    btc_data = self.product_map.get('BTC', {})
+                    logging.info(f"Verification: BTC is Product ID {btc_data.get('id')}")
+                    return True
+                else:
+                    logging.error("Failed to extract rules from SDK response. Retrying in 10s...")
+            except Exception as e:
+                logging.error(f"Market Sync Exception: {e}. Retrying in 10s...")
+            await asyncio.sleep(10)
 
     async def api_get(self, url: str):
         async with self.session.get(url, timeout=15) as r:
@@ -168,6 +168,7 @@ class NadoQuantBot:
                     for t in old:
                         if t in self.trader_ws_tasks: self.trader_ws_tasks[t].cancel(); del self.trader_ws_tasks[t]
                     
+                    logging.info(f"Monitoring {len(self.tracked_traders)} Pro Traders on HL.")
             except Exception as e: logging.error(f"LB Loop Error: {e}")
             await asyncio.sleep(300)
 
@@ -237,7 +238,7 @@ class NadoQuantBot:
 
             final_px = self._round_step(target_px, market["p_tick"])
             
-            # 3. Use Margin Manager for True Balance
+            # 3. Use Official Margin Manager for True Balance
             sub_info = await asyncio.to_thread(self.client.context.engine_client.get_subaccount_info, self.subaccount_hex)
             iso_res = await asyncio.to_thread(self.client.context.engine_client.get_isolated_positions, self.subaccount_hex)
             iso_pos = getattr(iso_res, 'isolated_positions',[])
@@ -255,10 +256,13 @@ class NadoQuantBot:
             qty = usd_amt / px
             final_qty = self._round_step(qty, market["s_tick"])
 
-            # 4. FLAWLESS X18 EVM MATH (Eliminates Code 2000 errors)
+            if final_qty <= 0 or final_qty < market["min_s"]:
+                logging.warning(f"Skipping {coin}: Computed qty {final_qty} is below Nado limit {market['min_s']}.")
+                return
+
+            # 4. FLAWLESS X18 EVM MATH
             appendix = build_appendix(order_type=OrderType.IOC, reduce_only=is_close)
             
-            # Converts precisely without floating fractions (e.g. exactly 69743600000000000000000)
             price_x18 = int((Decimal(str(final_px)) * Decimal("1e18")).to_integral_value())
             amount_x18 = int((Decimal(str(final_qty)) * Decimal("1e18")).to_integral_value())
             if not is_buy: amount_x18 = -amount_x18
@@ -275,48 +279,4 @@ class NadoQuantBot:
             logging.info(f"NADO EXECUTION: {coin} | Side: {'BUY' if is_buy else 'SELL'} | Px: {final_px} | Qty: {final_qty}")
             res = await asyncio.to_thread(self.client.market.place_order, PlaceOrderParams(product_id=market["id"], order=order))
             
-            success = getattr(res, 'success', False)
-            if not success and isinstance(res, dict): success = res.get('success', False)
-            if not success and "success=true" in str(res).lower(): success = True
-
-            if success:
-                logging.info(f"NADO SUCCESS: {coin} Trade Complete!")
-                if is_close: 
-                    del self.bot_state["positions"][coin]
-                else: 
-                    self.bot_state["positions"][coin] = {"trader": trader, "is_buy": is_buy}
-                self.save_state()
-            else:
-                msg = getattr(res, 'message', str(res))
-                logging.error(f"NADO REJECTED: {msg}")
-
-        except Exception as e:
-            logging.error(f"Order Execution Failure: {e}")
-
-    async def run(self):
-        self.running = True; self.session = aiohttp.ClientSession()
-        
-        # Flawless sync, will not block execution
-        await self.sync_market_data()
-
-        asyncio.create_task(self.leaderboard_loop())
-        await self.process_loop()
-
-    async def close(self):
-        self.running = False; await self.session.close()
-
-async def main():
-    bot = NadoQuantBot()
-    loop = asyncio.get_running_loop()
-    stop = asyncio.Event()
-    def sig_h(): stop.set()
-    for s in (signal.SIGINT, signal.SIGTERM): loop.add_signal_handler(s, sig_h)
-    
-    t = asyncio.create_task(bot.run())
-    await stop.wait()
-    await bot.close()
-    t.cancel()
-
-if __name__ == "__main__":
-    try: asyncio.run(main())
-    except KeyboardInterrupt: pass
+            success = getattr(res, '
