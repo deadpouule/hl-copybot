@@ -1,4 +1,4 @@
-import asyncio, aiohttp, websockets, json, logging, os, signal, time, struct, warnings, re, sys
+import asyncio, aiohttp, websockets, json, logging, os, signal, time, warnings, re, sys
 from logging.handlers import RotatingFileHandler
 from typing import Dict, List, Optional, Set
 from dotenv import load_dotenv
@@ -22,26 +22,22 @@ NADO_PK = os.getenv("NADO_PRIVATE_KEY")
 NADO_ID = os.getenv("NADO_ACCOUNT_ID")
 NADO_ENV = "mainnet"
 
-# HL Sourcing Settings
 TOP_X_TRADERS = 5
-ALLOWED_COINS = ["BTC", "ETH", "SOL", "HYPE", "BNB", "PAX", "XAG", "WTI"]
-
-# Risk Settings
-RISK_POS_PCT = 0.10        # 10% of balance
+ALLOWED_COINS =["BTC", "ETH", "SOL", "HYPE", "BNB", "PAX", "XAG", "WTI"]
+RISK_POS_PCT = 0.10        
 MIN_ORDER_USD = 11.0       
 
-# Logging Setup
 os.makedirs("logs", exist_ok=True)
 log_handler = RotatingFileHandler("logs/bot.log", maxBytes=10*1024*1024, backupCount=5)
 logging.basicConfig(
     level=logging.INFO, 
-    format="%(asctime)s [%(levelname)s] %(message)s", 
+    format="%(asctime)s[%(levelname)s] %(message)s", 
     handlers=[log_handler, logging.StreamHandler()]
 )
 
 class NadoQuantBot:
     def __init__(self):
-        logging.info("Initializing Improved Nado Execution Engine...")
+        logging.info("Initializing Bulletproof Nado Engine...")
         self.client = create_nado_client(NADO_ENV, NADO_PK)
         self.owner = self.client.context.engine_client.signer.address
         self.subaccount_hex = subaccount_to_hex(self.owner, "default")
@@ -51,7 +47,6 @@ class NadoQuantBot:
         self.trader_positions = {}
         self.trader_ws_tasks = {}
         
-        # PERSISTENT STATE
         self.state_file = "nado_bot_state.json"
         self.bot_state = {"positions": {}}
         self.load_state()
@@ -65,30 +60,65 @@ class NadoQuantBot:
             try:
                 with open(self.state_file, "r") as f:
                     self.bot_state = json.load(f)
-                logging.info(f"Loaded {len(self.bot_state['positions'])} existing trades from memory.")
             except: pass
 
     def save_state(self):
         with open(self.state_file, "w") as f:
             json.dump(self.bot_state, f)
 
+    def _safe_parse(self, obj):
+        """Forces any SDK object (Pydantic, Response, Tuple) into a standard dictionary."""
+        if hasattr(obj, 'data'): obj = obj.data
+        if hasattr(obj, 'dict'): return obj.dict()
+        if hasattr(obj, 'model_dump'): return obj.model_dump()
+        if isinstance(obj, dict): return obj
+        if hasattr(obj, '__dict__'): return vars(obj)
+        return {}
+
     async def sync_market_data(self):
-        """Map Symbols to IDs and fetch precision rules."""
+        """Safely fetch and parse all precision rules from Nado."""
         try:
             res = await asyncio.to_thread(self.client.market.get_all_engine_markets)
-            markets = res.data if hasattr(res, 'data') else res
-            for m in markets:
-                ticker = m.get('symbol', '')
+            
+            # 1. Safely extract the list of markets
+            payload = getattr(res, 'data', res)
+            market_list =[]
+            
+            if isinstance(payload, list):
+                market_list = payload
+            else:
+                parsed_dict = self._safe_parse(payload)
+                for key in ['rows', 'markets', 'products', 'data']:
+                    if key in parsed_dict and isinstance(parsed_dict[key], list):
+                        market_list = parsed_dict[key]
+                        break
+                if not market_list and isinstance(parsed_dict, dict):
+                    market_list = list(parsed_dict.values())
+
+            # 2. Iterate and map products safely
+            count = 0
+            for m in market_list:
+                m_dict = self._safe_parse(m)
+                ticker = str(m_dict.get('symbol', ''))
                 if 'PERP_' in ticker:
-                    coin = ticker.split('_')[1]
-                    self.product_map[coin] = {
-                        "id": m.get('product_id'),
-                        "p_tick": float(m.get('price_increment', 0)),
-                        "s_tick": float(m.get('base_tick', 0)),
-                        "min_s": float(m.get('min_base_amount', 0))
-                    }
-            logging.info(f"Market Sync Complete: {len(self.product_map)} pairs loaded.")
-            return True
+                    parts = ticker.split('_')
+                    if len(parts) > 1:
+                        coin = parts[1]
+                        self.product_map[coin] = {
+                            "id": int(m_dict.get('product_id', 0)),
+                            "p_tick": float(m_dict.get('price_increment', 0.0001)),
+                            "s_tick": float(m_dict.get('base_tick', 0.0001)),
+                            "min_s": float(m_dict.get('min_base_amount', 0.0001))
+                        }
+                        count += 1
+                        
+            if count > 0:
+                logging.info(f"Market Sync Complete: {len(self.product_map)} Perpetual pairs loaded.")
+                return True
+            else:
+                logging.error("Market Sync failed: Extracted empty product list.")
+                return False
+                
         except Exception as e:
             logging.error(f"Market Sync Failed: {e}")
             return False
@@ -111,7 +141,7 @@ class NadoQuantBot:
             try:
                 data = await self.api_get("https://stats-data.hyperliquid.xyz/Mainnet/leaderboard")
                 if data:
-                    raw = []; self._extract_traders(data, raw)
+                    raw =[]; self._extract_traders(data, raw)
                     processed = {}
                     for t in raw:
                         addr = t.get("account") or t.get("user") or t.get("ethAddress")
@@ -121,7 +151,6 @@ class NadoQuantBot:
                     ranked = sorted(processed.items(), key=lambda x: x[1], reverse=True)
                     top_selected = {r[0] for r in ranked[:TOP_X_TRADERS]}
                     
-                    # Ensure we keep tracking traders we currently have open positions for
                     for p in self.bot_state["positions"].values():
                         top_selected.add(p["trader"])
 
@@ -133,7 +162,7 @@ class NadoQuantBot:
                         self.trader_ws_tasks[t] = asyncio.create_task(self.trader_ws_loop(t))
                     for t in old:
                         if t in self.trader_ws_tasks: self.trader_ws_tasks[t].cancel(); del self.trader_ws_tasks[t]
-                    logging.info(f"Monitoring {len(self.tracked_traders)} traders based on ROI.")
+                    logging.info(f"Monitoring {len(self.tracked_traders)} traders.")
             except Exception as e: logging.error(f"LB Loop Error: {e}")
             await asyncio.sleep(300)
 
@@ -178,7 +207,6 @@ class NadoQuantBot:
         return round(round(val / step) * step, 10)
 
     async def execute_nado_order(self, coin: str, is_buy: bool, trader: str, is_close: bool):
-        # Double check memory to prevent double-opening
         if not is_close and coin in self.bot_state["positions"]: return
         if is_close and coin not in self.bot_state["positions"]: return
         
@@ -186,14 +214,11 @@ class NadoQuantBot:
         if not market: return
 
         try:
-            # 1. Fetch Proxy Price
             async with self.session.post("https://api.hyperliquid.xyz/info", json={"type": "allMids"}) as r:
                 mids = await r.json()
                 px = float(mids.get(coin.upper(), 0))
             if px == 0: return
 
-            # 2. Precision Math
-            # Use 3% slippage to ensure Market fill
             target_px = px * (1.03 if is_buy else 0.97)
             if is_close:
                 is_buy = not self.bot_state["positions"][coin]["is_buy"]
@@ -201,22 +226,23 @@ class NadoQuantBot:
 
             final_px = self._round_step(target_px, market["p_tick"])
             
-            # 3. Determine Nado Balance
+            # Fetch balance safely
             res_bal = await asyncio.to_thread(self.client.subaccount.get_engine_subaccount_summary, self.subaccount_hex)
+            bal_dict = self._safe_parse(res_bal)
+            
             balance = 0.0
-            balances = res_bal.data.get('spot_balances', []) if hasattr(res_bal, 'data') else []
-            for b in balances:
-                if b.get('product_id') == 0: balance = float(b.get('balance', 0))
+            for b in bal_dict.get('spot_balances',[]):
+                b_dict = self._safe_parse(b)
+                if b_dict.get('product_id') == 0: 
+                    balance = float(b_dict.get('balance', 0))
             
             usd_amt = max(balance * RISK_POS_PCT, MIN_ORDER_USD)
             qty = usd_amt / px
             final_qty = self._round_step(qty, market["size_tick"])
-            if final_qty < market["min_size"]: return
+            if final_qty < market["min_s"]: return
 
-            # 4. Bit-Packed Appendix (IOC = Immediate execution)
             appendix = build_appendix(order_type=OrderType.IOC, reduce_only=is_close)
 
-            # 5. Build Nado Order object
             order = OrderParams(
                 sender=SubaccountParams(subaccount_owner=self.owner, subaccount_name="default"),
                 priceX18=to_x18(final_px),
@@ -226,7 +252,6 @@ class NadoQuantBot:
                 appendix=appendix
             )
 
-            # 6. Execute via Engine
             logging.info(f"NADO: Mirroring {coin} | Side: {'BUY' if is_buy else 'SELL'} | Px: {final_px}")
             res = await asyncio.to_thread(self.client.market.place_order, PlaceOrderParams(product_id=market["id"], order=order))
             
@@ -245,10 +270,15 @@ class NadoQuantBot:
 
     async def run(self):
         self.running = True; self.session = aiohttp.ClientSession()
-        if not await self.sync_market_data():
-            logging.critical("Nado Engine offline. Retrying in 10s...")
+        
+        # Keep retrying until Nado Market Sync succeeds
+        while self.running:
+            if await self.sync_market_data():
+                break
+            logging.critical("Nado Engine sync failed. Retrying in 10s...")
             await asyncio.sleep(10)
-            return
+            
+        if not self.running: return
 
         asyncio.create_task(self.leaderboard_loop())
         await self.process_loop()
@@ -260,7 +290,9 @@ async def main():
     bot = NadoQuantBot()
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
-    for sig in (signal.SIGINT, signal.SIGTERM): loop.add_signal_handler(sig, stop.set)
+    def sig_h(): stop.set()
+    for s in (signal.SIGINT, signal.SIGTERM): loop.add_signal_handler(s, sig_h)
+    
     t = asyncio.create_task(bot.run())
     await stop.wait()
     await bot.close()
