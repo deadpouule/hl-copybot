@@ -1,30 +1,3 @@
-**Refining the Synchronization**
-
-I'm now completely confident in the data synchronization from `get_all_engine_markets()`. The function now reliably handles various response formats, including tuples, lists, and dictionaries with full error handling. I'm focusing on ensuring robust symbol extraction, `product_id` retrieval, and tick size conversion, with a retry mechanism. This updated approach fixes the underlying data issues and I am almost certain the bot is working as expected.
-
-
-**Finalizing the Workflow**
-
-I've integrated the full data sync method for market data into the main loop, including robust error handling and retry logic. I've ensured seamless extraction of `product_id`, tick sizes, and verified markets. I am confident the bot has robust market synchronization with the corrected integer price conversion logic.
-
-
-This is exactly what we needed to see! The logs have handed us the final pieces of the puzzle. 
-
-Here is exactly what those errors mean:
-1.  **BTC Error (Code 2000):** *"Price not divisible by price_increment_x18"*. This proves that on Nado, the tick size for BTC is exactly `$1.00`, but because my safety fallback kicked in, it sent a price with a decimal (like `$69743.6`). Nado strictly rejected the fraction.
-2.  **ETH & SOL Error (Code 2007):** *"Price must be within 20% to 500% of oracle price"*. This happened because my fallback used the wrong **Product IDs**. If Orderly's actual Product `2` is a coin worth $5, sending ETH's $1899 price to it triggered their safety alarms because it thought you were trying to buy a $5 asset for $1899!
-
-We can no longer rely on hardcoded fallbacks. The bot **must** extract the true Product IDs and Tick Sizes directly from the Orderly engine.
-
-### The Ultimate Fix
-I have completely rewritten the `sync_market_data` function. It now features an **Aggressive Unpacker** that will rip the real IDs and tick sizes out of the SDK regardless of how heavily they are nested in Tuples or Pydantic models. 
-
-It will also **pause startup** until it successfully verifies the real IDs, so it is physically impossible to send the wrong ID or bad decimal math ever again.
-
-### Final `copy_trading_bot.py`
-**Copy this entire block and paste it into GitHub:**
-
-```python
 import asyncio, aiohttp, websockets, json, logging, os, signal, time, warnings, re, sys
 from logging.handlers import RotatingFileHandler
 from typing import Dict, List, Optional, Set
@@ -110,7 +83,6 @@ class NadoQuantBot:
                 logging.info("Downloading true Market IDs and Rules from Nado Engine...")
                 res = await asyncio.to_thread(self.client.market.get_all_engine_markets)
                 
-                # Aggressively unwrap the payload regardless of SDK Version
                 items =[]
                 if isinstance(res, dict): items = list(res.values())
                 elif hasattr(res, 'items'): items = list(res.values())
@@ -122,7 +94,6 @@ class NadoQuantBot:
                 
                 count = 0
                 for m in items:
-                    # Unwrap Tuples if SDK returns (id, object)
                     if isinstance(m, tuple) and len(m) == 2: m = m[1]
                     m_dict = self._safe_parse(m)
                     
@@ -130,11 +101,9 @@ class NadoQuantBot:
                     if 'PERP_' in symbol:
                         coin = symbol.split('_')[1]
                         
-                        # Extract Product ID safely
                         pid = m_dict.get('product_id')
                         if pid is None: pid = m_dict.get('productId')
                         
-                        # Extract Tick Sizes natively (Handle x18 scale if present)
                         p_tick = m_dict.get('price_increment_x18')
                         if p_tick: p_tick = float(p_tick) / 1e18
                         else: p_tick = m_dict.get('price_increment')
@@ -153,7 +122,6 @@ class NadoQuantBot:
                 
                 if count > 0:
                     logging.info(f"Market Sync SUCCESS! {count} pairs loaded perfectly.")
-                    # Print samples to verify it worked
                     btc_id = self.product_map.get('BTC', {}).get('id')
                     eth_id = self.product_map.get('ETH', {}).get('id')
                     logging.info(f"Verification: BTC is Product {btc_id} | ETH is Product {eth_id}")
@@ -286,7 +254,7 @@ class NadoQuantBot:
             qty = usd_amt / px
             final_qty = self._round_step(qty, market["s_tick"])
 
-            # 4. Construct EXACT X18 Values (Direct Math avoids 'to_x18' SDK bugs)
+            # 4. Construct EXACT X18 Values (Direct Math avoids bugs)
             appendix = build_appendix(order_type=OrderType.IOC, reduce_only=is_close)
             amount_x18 = int(round(final_qty * 1e18))
             if not is_buy: amount_x18 = -amount_x18
@@ -310,8 +278,10 @@ class NadoQuantBot:
 
             if success:
                 logging.info(f"NADO SUCCESS: {coin} Trade Complete!")
-                if is_close: del self.bot_state["positions"][coin]
-                else: self.bot_state["positions"][coin] = {"trader": trader, "is_buy": is_buy}
+                if is_close: 
+                    del self.bot_state["positions"][coin]
+                else: 
+                    self.bot_state["positions"][coin] = {"trader": trader, "is_buy": is_buy}
                 self.save_state()
             else:
                 msg = getattr(res, 'message', str(res))
