@@ -1,10 +1,10 @@
-import asyncio, aiohttp, websockets, json, logging, os, signal, time, warnings, re
+import asyncio, aiohttp, websockets, json, logging, os, signal, time, warnings, re, sys
 from logging.handlers import RotatingFileHandler
 from typing import Dict, List, Optional, Set
 from dotenv import load_dotenv
 from decimal import Decimal, ROUND_HALF_UP
 
-# --- OFFICIAL NADO PROTOCOL SDK IMPORTS ---
+# Official Nado Protocol SDK Imports
 from nado_protocol.client import create_nado_client
 from nado_protocol.engine_client.types.execute import OrderParams, PlaceOrderParams
 from nado_protocol.utils.expiration import OrderType, get_expiration_timestamp
@@ -38,7 +38,7 @@ logging.basicConfig(
 
 class NadoQuantBot:
     def __init__(self):
-        logging.info("Initializing Ultimate Nado Execution Engine...")
+        logging.info("Initializing Ultimate Precision Nado Engine...")
         self.client = create_nado_client(NADO_ENV, NADO_PK)
         self.owner = self.client.context.engine_client.signer.address
         self.subaccount_hex = subaccount_to_hex(self.owner, "default")
@@ -47,7 +47,6 @@ class NadoQuantBot:
         self.tracked_traders = set()
         self.trader_positions = {}
         self.trader_ws_tasks = {}
-        self.all_mids = {}
         
         self.state_file = "nado_bot_state.json"
         self.bot_state = {"positions": {}}
@@ -68,25 +67,57 @@ class NadoQuantBot:
         with open(self.state_file, "w") as f:
             json.dump(self.bot_state, f)
 
+    def _safe_parse(self, obj):
+        try:
+            if isinstance(obj, dict): return obj
+            if hasattr(obj, 'dict'): return obj.dict()
+            if hasattr(obj, 'model_dump'): return obj.model_dump()
+            if hasattr(obj, '_asdict'): return obj._asdict()
+            if hasattr(obj, '__dict__'): return vars(obj)
+        except: pass
+        return {}
+
     async def sync_market_data(self):
-        """Bypasses SDK objects. Fetches pristine JSON directly from Orderly API."""
+        """Forces the bot to retrieve TRUE Product IDs and Tick Sizes from Orderly Engine."""
         while self.running:
             try:
-                logging.info("Downloading Market Rules directly from Orderly REST API...")
-                async with self.session.get("https://api-evm.orderly.org/v1/public/info") as r:
-                    res = await r.json()
+                logging.info("Downloading true Market IDs and Rules from Nado Engine...")
+                res = await asyncio.to_thread(self.client.market.get_all_engine_markets)
                 
-                rows = res.get("data", {}).get("rows",[])
+                # Aggressively unwrap the payload regardless of SDK Version
+                items =[]
+                if isinstance(res, dict): items = list(res.values())
+                elif hasattr(res, 'items'): items = list(res.values())
+                elif isinstance(res, list): items = res
+                elif hasattr(res, 'data'):
+                    d = res.data
+                    if isinstance(d, dict): items = list(d.values())
+                    elif isinstance(d, list): items = d
+                
                 count = 0
-                for m in rows:
-                    symbol = m.get("symbol", "")
-                    if "PERP_" in symbol:
-                        coin = symbol.split("_")[1]
+                for m in items:
+                    # Unwrap Tuples if SDK returns (id, object)
+                    if isinstance(m, tuple) and len(m) == 2: m = m[1]
+                    m_dict = self._safe_parse(m)
+                    
+                    symbol = m_dict.get('symbol', '')
+                    if 'PERP_' in symbol:
+                        coin = symbol.split('_')[1]
                         
-                        pid = m.get("product_id")
-                        p_tick = m.get("quote_tick")
-                        s_tick = m.get("base_tick")
-                        min_s = m.get("base_min")
+                        # Extract Product ID safely
+                        pid = m_dict.get('product_id')
+                        if pid is None: pid = m_dict.get('productId')
+                        
+                        # Extract Tick Sizes natively (Handle x18 scale if present)
+                        p_tick = m_dict.get('price_increment_x18')
+                        if p_tick: p_tick = float(p_tick) / 1e18
+                        else: p_tick = m_dict.get('price_increment')
+                        
+                        s_tick = m_dict.get('base_tick_x18')
+                        if s_tick: s_tick = float(s_tick) / 1e18
+                        else: s_tick = m_dict.get('base_tick')
+                        
+                        min_s = m_dict.get('min_base_amount') or 0.0001
                         
                         if pid is not None and p_tick and s_tick:
                             self.product_map[coin] = {
@@ -98,12 +129,15 @@ class NadoQuantBot:
                             count += 1
                 
                 if count > 0:
-                    logging.info(f"Market Sync SUCCESS! {count} exact asset pairs mapped.")
+                    logging.info(f"Market Sync SUCCESS! {count} pairs loaded perfectly.")
+                    btc_id = self.product_map.get('BTC', {}).get('id')
+                    eth_id = self.product_map.get('ETH', {}).get('id')
+                    logging.info(f"Verification: BTC is Product {btc_id} | ETH is Product {eth_id}")
                     return True
                 else:
-                    logging.error("Failed to parse Orderly REST API. Retrying in 10s...")
+                    logging.error("Failed to extract rules. Retrying in 10s...")
             except Exception as e:
-                logging.error(f"REST Market Sync Exception: {e}. Retrying in 10s...")
+                logging.error(f"Market Sync Exception: {e}. Retrying in 10s...")
             await asyncio.sleep(10)
 
     async def api_get(self, url: str):
@@ -120,7 +154,6 @@ class NadoQuantBot:
             for i in obj: self._extract_traders(i, container)
 
     async def leaderboard_loop(self):
-        """Scans HL Leaderboard for top Weekly performers."""
         while self.running:
             try:
                 data = await self.api_get("https://stats-data.hyperliquid.xyz/Mainnet/leaderboard")
@@ -135,7 +168,6 @@ class NadoQuantBot:
                     ranked = sorted(processed.items(), key=lambda x: x[1], reverse=True)
                     top_selected = {r[0] for r in ranked[:TOP_X_TRADERS]}
                     
-                    # Prevent closing connections for traders we have active trades with
                     for p in self.bot_state["positions"].values():
                         top_selected.add(p["trader"])
 
@@ -150,21 +182,7 @@ class NadoQuantBot:
             except Exception as e: logging.error(f"LB Loop Error: {e}")
             await asyncio.sleep(300)
 
-    async def mids_ws_loop(self):
-        """Maintains an instant, zero-latency cache of all prices to guarantee <200ms execution."""
-        uri = "wss://api.hyperliquid.xyz/ws"
-        while self.running:
-            try:
-                async with websockets.connect(uri) as ws:
-                    await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "allMids"}}))
-                    async for msg in ws:
-                        if not self.running: break
-                        d = json.loads(msg)
-                        if d.get("channel") == "allMids": self.all_mids.update(d["data"]["mids"])
-            except: await asyncio.sleep(2)
-
     async def trader_ws_loop(self, trader: str):
-        """Listens directly to the HL WebSocket for instant trade signals."""
         uri = "wss://api.hyperliquid.xyz/ws"
         while self.running and trader in self.tracked_traders:
             try:
@@ -179,12 +197,11 @@ class NadoQuantBot:
                 if self.running: await asyncio.sleep(5)
 
     async def process_loop(self):
-        """Instantly parses signals from the queue and routes to execution."""
         while self.running:
             data = await self.signal_queue.get()
             try:
                 trader = data.get("trader_address")
-                raw_pos = data.get("data", {}).get("clearinghouseState", {}).get("assetPositions", [])
+                raw_pos = data.get("data", {}).get("clearinghouseState", {}).get("assetPositions",[])
                 new_state = {p["position"]["coin"]: float(p["position"]["szi"]) for p in raw_pos if float(p["position"]["szi"]) != 0}
                 
                 old_state = self.trader_positions.get(trader, {})
@@ -217,11 +234,13 @@ class NadoQuantBot:
         if not market: return
 
         try:
-            # 1. Instant Proxy Price from Cache (0 ms delay)
-            px = float(self.all_mids.get(coin.upper(), 0))
+            # 1. Proxy Price via HL
+            async with self.session.post("https://api.hyperliquid.xyz/info", json={"type": "allMids"}) as r:
+                mids = await r.json()
+                px = float(mids.get(coin.upper(), 0))
             if px == 0: return
 
-            # 2. Precision Math & Slippage (5% allowed to guarantee market fill)
+            # 2. Add 5% Slippage to ensure Market fill, then ROUND EXACTLY to Orderly's rules
             target_px = px * (1.05 if is_buy else 0.95)
             if is_close:
                 is_buy = not self.bot_state["positions"][coin]["is_buy"]
@@ -229,7 +248,7 @@ class NadoQuantBot:
 
             final_px = self._round_step(target_px, market["p_tick"])
             
-            # 3. Official SDK Margin Manager for Flawless Balance Checks
+            # 3. Use Official SDK Margin Manager to get exact available balance
             sub_info = await asyncio.to_thread(self.client.context.engine_client.get_subaccount_info, self.subaccount_hex)
             iso_res = await asyncio.to_thread(self.client.context.engine_client.get_isolated_positions, self.subaccount_hex)
             iso_pos = getattr(iso_res, 'isolated_positions',[])
@@ -269,7 +288,7 @@ class NadoQuantBot:
 
             logging.info(f"NADO EXECUTION: {coin} | Side: {'BUY' if is_buy else 'SELL'} | Px: {final_px} | Qty: {final_qty}")
             
-            # 5. Place the order exactly as documented
+            # 5. Place the order
             res = await asyncio.to_thread(self.client.market.place_order, PlaceOrderParams(product_id=market["id"], order=order))
             
             success = getattr(res, 'success', False)
@@ -296,8 +315,6 @@ class NadoQuantBot:
         # Block until rules are securely loaded
         await self.sync_market_data()
 
-        # Start background threads concurrently
-        asyncio.create_task(self.mids_ws_loop())
         asyncio.create_task(self.leaderboard_loop())
         await self.process_loop()
 
