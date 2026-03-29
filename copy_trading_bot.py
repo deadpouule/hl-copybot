@@ -39,7 +39,7 @@ logging.basicConfig(
 
 class NadoQuantBot:
     def __init__(self):
-        logging.info("Initializing Final Decimal-Safe Nado Engine...")
+        logging.info("Initializing Final Hardcoded Nado Engine...")
         self.client = create_nado_client(NADO_ENV, NADO_PK)
         self.owner = self.client.context.engine_client.signer.address
         self.subaccount_hex = subaccount_to_hex(self.owner, "default")
@@ -57,7 +57,18 @@ class NadoQuantBot:
 
         self.signal_queue = asyncio.Queue()
         self.running = False
-        self.product_map = {}
+        
+        # FINAL HARDCODED MAP: Extracted from your specific environment results
+        self.product_map = {
+            "BTC": {"id": 1, "p_tick": Decimal("0.1"), "s_tick": Decimal("0.00001")},
+            "ETH": {"id": 2, "p_tick": Decimal("0.01"), "s_tick": Decimal("0.0001")},
+            "SOL": {"id": 3, "p_tick": Decimal("0.001"), "s_tick": Decimal("0.01")},
+            "BNB": {"id": 4, "p_tick": Decimal("0.01"), "s_tick": Decimal("0.001")},
+            "HYPE": {"id": 100, "p_tick": Decimal("0.001"), "s_tick": Decimal("0.01")},
+            "XAG": {"id": 11, "p_tick": Decimal("0.01"), "s_tick": Decimal("0.01")},
+            "PAX": {"id": 12, "p_tick": Decimal("0.1"), "s_tick": Decimal("0.001")},
+            "WTI": {"id": 10, "p_tick": Decimal("0.01"), "s_tick": Decimal("0.1")}
+        }
 
     def load_state(self):
         if os.path.exists(self.state_file):
@@ -70,61 +81,6 @@ class NadoQuantBot:
     def save_state(self):
         with open(self.state_file, "w") as f:
             json.dump(self.bot_state, f)
-
-    def _deep_search(self, obj):
-        """Recursively digs through SDK objects to find Market data."""
-        found = []
-        if isinstance(obj, dict):
-            if 'symbol' in obj and ('product_id' in obj or 'productId' in obj):
-                found.append(obj)
-            for v in obj.values(): found.extend(self._deep_search(v))
-        elif isinstance(obj, (list, tuple, set)):
-            for i in obj: found.extend(self._deep_search(i))
-        elif hasattr(obj, 'model_dump'): found.extend(self._deep_search(obj.model_dump()))
-        elif hasattr(obj, '__dict__'): found.extend(self._deep_search(vars(obj)))
-        return found
-
-    async def sync_market_data(self):
-        """Guaranteed Market Sync: Tries SDK, then Fallbacks to Direct HTTP."""
-        while self.running:
-            try:
-                logging.info("Syncing Market Rules...")
-                # Attempt 1: Nado SDK
-                res = await asyncio.to_thread(self.client.market.get_all_engine_markets)
-                markets = self._deep_search(res)
-                
-                # Attempt 2: If SDK empty, use Direct HTTP to Orderly Public API
-                if not markets:
-                    async with self.session.get("https://api-evm.orderly.org/v1/public/info") as r:
-                        if r.status == 200:
-                            js = await r.json()
-                            markets = js.get('data', {}).get('rows', [])
-
-                count = 0
-                for m in markets:
-                    symbol = str(m.get('symbol', ''))
-                    if 'PERP_' in symbol:
-                        coin = symbol.split('_')[1]
-                        pid = m.get('product_id') or m.get('productId')
-                        # Precision ticks
-                        p_tick = m.get('quote_tick') or m.get('price_increment')
-                        s_tick = m.get('base_tick')
-                        min_s = m.get('base_min') or m.get('min_base_amount')
-
-                        if pid and p_tick and s_tick:
-                            self.product_map[coin] = {
-                                "id": int(pid), "p_tick": float(p_tick), 
-                                "s_tick": float(s_tick), "min_s": float(min_s or s_tick)
-                            }
-                            count += 1
-                
-                if count > 0:
-                    logging.info(f"Market Sync SUCCESS: {count} assets mapped.")
-                    return True
-            except Exception as e:
-                logging.error(f"Sync error: {e}")
-            
-            await asyncio.sleep(10)
 
     async def orderly_mids_loop(self):
         """Fetches mark prices directly from Orderly every 5s."""
@@ -212,7 +168,7 @@ class NadoQuantBot:
 
     def _round_step(self, val, step):
         val_d, step_d = Decimal(str(val)), Decimal(str(step))
-        return (val_d / step_d).quantize(Decimal('1'), rounding=ROUND_DOWN) * step_d
+        return (val_d / step_d).quantize(Decimal('1'), rounding=ROUND_DOWN) * step
 
     async def execute_nado_order(self, coin: str, is_buy: bool, trader: str, is_close: bool):
         if not is_close and coin in self.bot_state["positions"]: return
@@ -221,7 +177,6 @@ class NadoQuantBot:
         if not market: return
 
         try:
-            # Mark price from Orderly cache
             px = self.orderly_mids.get(coin.upper(), 0.0)
             if px == 0: return
 
@@ -232,7 +187,6 @@ class NadoQuantBot:
 
             final_px = self._round_step(target_px, market["p_tick"])
             
-            # Official Margin Manager
             sub_info = await asyncio.to_thread(self.client.context.engine_client.get_subaccount_info, self.subaccount_hex)
             iso_res = await asyncio.to_thread(self.client.context.engine_client.get_isolated_positions, self.subaccount_hex)
             manager = MarginManager(sub_info, getattr(iso_res, 'isolated_positions', []))
@@ -243,7 +197,7 @@ class NadoQuantBot:
             if available < usd_amt and not is_close: return
             
             final_qty = self._round_step(usd_amt / px, market["s_tick"])
-            if final_qty < Decimal(str(market["min_s"])): return
+            if final_qty <= 0: return
 
             # Construct EXACT X18 Values
             amount_x18 = int((final_qty * Decimal("1e18")).to_integral_value())
@@ -276,7 +230,7 @@ class NadoQuantBot:
 
     async def run(self):
         self.running = True; self.session = aiohttp.ClientSession()
-        await self.sync_market_data()
+        logging.info("Engine Armed. Monitoring HL Traders for Major Assets.")
         asyncio.create_task(self.orderly_mids_loop())
         asyncio.create_task(self.leaderboard_loop())
         await self.process_loop()
