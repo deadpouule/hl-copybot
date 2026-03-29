@@ -1,26 +1,20 @@
-import os
-from nado_protocol.client import create_nado_client
-from dotenv import load_dotenv
-
-load_dotenv('/root/hl-copybot/.env')
-client = create_nado_client('mainnet', os.getenv('NADO_PRIVATE_KEY'))
+import requests
 
 print('\n--- COPY THIS TO SEND TO ME ---')
 try:
-    res = client.market.get_all_engine_markets()
-    markets = getattr(res, 'data', res)
-    if isinstance(markets, dict): markets = list(markets.values())
+    res = requests.get("https://api-evm.orderly.org/v1/public/info")
+    data = res.json()
     
-    for m in markets:
-        m_dict = m if isinstance(m, dict) else vars(m)
-        sym = m_dict.get('symbol', '')
+    for m in data.get('data', {}).get('rows',[]):
+        sym = m.get('symbol', '')
         if 'PERP_' in sym:
             coin = sym.split('_')[1]
             if coin in['BTC', 'ETH', 'SOL', 'HYPE', 'BNB', 'PAX', 'XAG', 'WTI']:
-                pid = m_dict.get('product_id', m_dict.get('productId'))
-                p_tick = float(m_dict.get('price_increment_x18', 0))/1e18
-                s_tick = float(m_dict.get('base_tick_x18', 0))/1e18
-                print(f'"{coin}": {{"id": {pid}, "p_tick": {p_tick}, "s_tick": {s_tick}}},')
+                pid = m.get('product_id')
+                p_tick = m.get('quote_tick')
+                s_tick = m.get('base_tick')
+                min_s = m.get('base_min')
+                print(f'"{coin}": {{"id": {pid}, "p_tick": {p_tick}, "s_tick": {s_tick}, "min_s": {min_s}}},')
 except Exception as e:
     print(f'Error: {e}')
 print('-------------------------------\n')
