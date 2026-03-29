@@ -1,4 +1,4 @@
-import asyncio, aiohttp, websockets, json, logging, os, signal, time, warnings, re
+import asyncio, aiohttp, websockets, json, logging, os, signal, time, warnings, re, sys
 from logging.handlers import RotatingFileHandler
 from typing import Dict, List, Optional, Set
 from dotenv import load_dotenv
@@ -23,7 +23,7 @@ NADO_ID = os.getenv("NADO_ACCOUNT_ID")
 NADO_ENV = "mainnet"
 
 TOP_X_TRADERS = 5
-ALLOWED_COINS = ["BTC", "ETH", "SOL", "HYPE", "BNB"]
+ALLOWED_COINS =["BTC", "ETH", "SOL", "HYPE", "BNB", "PAX", "XAG", "WTI"]
 
 RISK_POS_PCT = 0.10        # 10% of available margin per trade
 MIN_ORDER_USD = 11.0       # Exchange minimum
@@ -38,7 +38,7 @@ logging.basicConfig(
 
 class NadoQuantBot:
     def __init__(self):
-        logging.info("Initializing Instant Decimal-Safe Nado Engine...")
+        logging.info("Initializing Decimal-Safe Nado Engine...")
         self.client = create_nado_client(NADO_ENV, NADO_PK)
         self.owner = self.client.context.engine_client.signer.address
         self.subaccount_hex = subaccount_to_hex(self.owner, "default")
@@ -55,15 +55,7 @@ class NadoQuantBot:
         self.signal_queue = asyncio.Queue()
         self.running = False
         self.orderly_mids = {}
-        
-        # Hardcoded, mathematically perfect precision rules extracted from Orderly
-        self.product_map = {
-            "BTC": {"id": 1, "p_tick": Decimal("0.1"), "s_tick": Decimal("0.00001"), "min_s": Decimal("0.00001")},
-            "ETH": {"id": 2, "p_tick": Decimal("0.01"), "s_tick": Decimal("0.0001"), "min_s": Decimal("0.0001")},
-            "SOL": {"id": 3, "p_tick": Decimal("0.001"), "s_tick": Decimal("0.01"), "min_s": Decimal("0.01")},
-            "BNB": {"id": 4, "p_tick": Decimal("0.01"), "s_tick": Decimal("0.001"), "min_s": Decimal("0.001")},
-            "HYPE": {"id": 100, "p_tick": Decimal("0.001"), "s_tick": Decimal("0.01"), "min_s": Decimal("0.01")}
-        }
+        self.product_map = {}
 
     def load_state(self):
         if os.path.exists(self.state_file):
@@ -75,6 +67,57 @@ class NadoQuantBot:
     def save_state(self):
         with open(self.state_file, "w") as f:
             json.dump(self.bot_state, f)
+
+    async def sync_market_data(self):
+        """Extracts the TRUE Product IDs from the SDK Pydantic models."""
+        while self.running:
+            try:
+                logging.info("Downloading true Market IDs from Nado SDK...")
+                res = await asyncio.to_thread(self.client.market.get_all_engine_markets)
+                
+                # Handle SDK response types safely
+                items =[]
+                if hasattr(res, 'data'): items = res.data
+                elif isinstance(res, list): items = res
+                elif isinstance(res, tuple): items = list(res)
+                
+                count = 0
+                for m in items:
+                    # Unpack tuple if SDK wraps it like (id, MarketData)
+                    if isinstance(m, tuple) and len(m) == 2: m = m[1]
+                        
+                    # Safely extract variables from Pydantic models
+                    sym = getattr(m, 'symbol', None)
+                    pid = getattr(m, 'product_id', None)
+                    p_tick_x18 = getattr(m, 'price_increment_x18', None)
+                    s_tick_x18 = getattr(m, 'base_tick_x18', None)
+                    min_s_x18 = getattr(m, 'min_base_amount_x18', None)
+                    
+                    if sym and 'PERP_' in sym and pid is not None and p_tick_x18 and s_tick_x18:
+                        coin = sym.split('_')[1]
+                        
+                        p_tick = Decimal(str(p_tick_x18)) / Decimal("1000000000000000000")
+                        s_tick = Decimal(str(s_tick_x18)) / Decimal("1000000000000000000")
+                        min_s = Decimal(str(min_s_x18)) / Decimal("1000000000000000000") if min_s_x18 else s_tick
+                        
+                        self.product_map[coin] = {
+                            "id": int(pid),
+                            "p_tick": p_tick,
+                            "s_tick": s_tick,
+                            "min_s": min_s
+                        }
+                        count += 1
+                        
+                if count > 0:
+                    logging.info(f"Market Sync SUCCESS! {count} true asset pairs mapped.")
+                    btc_id = self.product_map.get('BTC', {}).get('id')
+                    logging.info(f"Verification: BTC is Product ID {btc_id}")
+                    return True
+            except Exception as e:
+                logging.error(f"Market Sync Error: {e}")
+            
+            logging.error("Failed to extract rules from SDK. Retrying in 10s...")
+            await asyncio.sleep(10)
 
     async def orderly_mids_loop(self):
         """Fetches prices directly from Orderly to guarantee NO Oracle Price Mismatches."""
@@ -109,8 +152,7 @@ class NadoQuantBot:
             try:
                 data = await self.api_get("https://stats-data.hyperliquid.xyz/Mainnet/leaderboard")
                 if data:
-                    raw =[]
-                    self._extract_traders(data, raw)
+                    raw =[]; self._extract_traders(data, raw)
                     processed = {}
                     for t in raw:
                         addr = t.get("account") or t.get("user") or t.get("ethAddress")
@@ -154,7 +196,7 @@ class NadoQuantBot:
             data = await self.signal_queue.get()
             try:
                 trader = data.get("trader_address")
-                raw_pos = data.get("data", {}).get("clearinghouseState", {}).get("assetPositions", [])
+                raw_pos = data.get("data", {}).get("clearinghouseState", {}).get("assetPositions",[])
                 new_state = {p["position"]["coin"]: float(p["position"]["szi"]) for p in raw_pos if float(p["position"]["szi"]) != 0}
                 
                 old_state = self.trader_positions.get(trader, {})
@@ -238,7 +280,7 @@ class NadoQuantBot:
 
             logging.info(f"NADO EXECUTION: {coin} | Side: {'BUY' if is_buy else 'SELL'} | Px: {final_px} | Qty: {final_qty}")
             
-            # 5. Place the order exactly as documented
+            # 5. Place the order
             res = await asyncio.to_thread(self.client.market.place_order, PlaceOrderParams(product_id=market["id"], order=order))
             
             success = getattr(res, 'success', False)
@@ -254,7 +296,11 @@ class NadoQuantBot:
                 self.save_state()
             else:
                 msg = getattr(res, 'message', str(res))
-                logging.error(f"NADO REJECTED: {msg}")
+                # HYPE Post-Only Graceful Handling
+                if '2117' in msg or 'post-only' in msg.lower():
+                    logging.warning(f"NADO SKIPPED: {coin} is in Post-Only mode right now.")
+                else:
+                    logging.error(f"NADO REJECTED: {msg}")
 
         except Exception as e:
             logging.error(f"Order Execution Failure: {e}")
@@ -264,6 +310,7 @@ class NadoQuantBot:
         self.session = aiohttp.ClientSession()
         
         # Start background threads concurrently
+        asyncio.create_task(self.sync_market_data())
         asyncio.create_task(self.orderly_mids_loop())
         asyncio.create_task(self.leaderboard_loop())
         await self.process_loop()
