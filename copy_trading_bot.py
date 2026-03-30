@@ -90,31 +90,74 @@ class NadoQuantBot:
                 logging.info("[SYNC] Fetching Perpetual IDs and Ticks from Nado...")
                 res = await asyncio.to_thread(self.client.context.engine_client.get_all_products)
                 
-                # Dynamically handle the response whether it's a List, Dict, or Object
+                # ==========================================
+                # 1. BRUTE-FORCE SDK REFLECTION (AUTODISCOVERY)
+                # ==========================================
                 perps =[]
+                
+                # If the response is already a list, use it
                 if isinstance(res, list):
                     perps = res
+                # If it's a dict, search its values for lists
                 elif isinstance(res, dict):
-                    perps = res.get('perp_products', res.get('products', res.get('data',[])))
+                    for k, v in res.items():
+                        if isinstance(v, list) and len(v) > 0:
+                            logging.info(f"[SYNC] 🔍 Found products list in dict key: '{k}'")
+                            perps = v
+                            break
+                # If it's an Object (AllProductsData), search its attributes for lists
                 else:
-                    perps = getattr(res, 'perp_products', getattr(res, 'products', getattr(res, 'data',[])))
+                    for attr in dir(res):
+                        if not attr.startswith('_'):
+                            try:
+                                val = getattr(res, attr)
+                                if isinstance(val, list) and len(val) > 0:
+                                    logging.info(f"[SYNC] 🔍 Found products list in object attribute: '{attr}'")
+                                    perps = val
+                                    break
+                            except Exception: pass
                 
+                # If we STILL haven't found a list, print the entire object structure to the console
+                if not perps:
+                    logging.warning(f"[SYNC] 🚨 FATAL: Could not find any list of products in the API response.")
+                    logging.warning(f"[SYNC] 🚨 SDK Object Type: {type(res)}")
+                    
+                    if hasattr(res, '__dict__'):
+                        logging.warning(f"[SYNC] 🚨 SDK Object Content: {vars(res)}")
+                    else:
+                        for attr in dir(res):
+                            if not attr.startswith('_'):
+                                try:
+                                    val = getattr(res, attr)
+                                    logging.warning(f"  -> {attr}: {type(val)} = {str(val)[:150]}")
+                                except Exception: pass
+                                
+                    await asyncio.sleep(10)
+                    continue  # Retry loop
+                
+                # ==========================================
+                # 2. PRODUCT PARSING & FILTERING
+                # ==========================================
                 count = 0
                 seen_symbols =[]
+                
+                # Log the structure of the first product to help debug if needed
+                first_product = perps[0]
+                logging.info(f"[SYNC] Discovered {len(perps)} total assets in Nado engine.")
                 
                 for p in perps:
                     # Dynamically extract fields whether the item is a Dict or Object
                     if isinstance(p, dict):
-                        symbol = str(p.get('symbol', p.get('name', ''))).upper()
+                        symbol = str(p.get('symbol', p.get('name', p.get('coin', '')))).upper()
                         pid = p.get('product_id', p.get('id', p.get('productId')))
-                        p_tick = p.get('price_increment_x18', p.get('priceIncrementX18', 0))
+                        p_tick = p.get('price_increment_x18', p.get('priceIncrementX18', p.get('szDecimals', 0)))
                         s_tick = p.get('base_tick_x18', p.get('baseTickX18', 0))
                         m_size = p.get('min_size', p.get('minSize', 0))
                     else:
-                        symbol = str(getattr(p, 'symbol', getattr(p, 'name', ''))).upper()
+                        symbol = str(getattr(p, 'symbol', getattr(p, 'name', getattr(p, 'coin', '')))).upper()
                         pid = getattr(p, 'product_id', getattr(p, 'id', getattr(p, 'productId', None)))
-                        p_tick = getattr(p, 'price_increment_x18', getattr(p, 'priceIncrementX18', 0))
-                        s_tick = getattr(p, 'base_tick_x18', getattr(p, 'baseTickX18', 0))
+                        p_tick = getattr(p, 'price_increment_x18', getattr(p, 'priceIncrementX18', getattr(p, 'szDecimals', 0)))
+                        s_tick = getattr(p, 'base_tick_x18', getattr(p, 'baseTickX18', getattr(p, 'stepSize', 0)))
                         m_size = getattr(p, 'min_size', getattr(p, 'minSize', 0))
 
                     if symbol:
@@ -123,17 +166,19 @@ class NadoQuantBot:
                     # Forgiving coin matching (removes -PERP, /USD, etc.)
                     coin = symbol.replace('-PERP', '').replace('/USD', '').replace('PERP', '').replace('-USDT', '')
                     
-                    if coin in ALLOWED_COINS and pid is not None:
+                    if coin in ALLOWED_COINS:
                         try:
-                            # Safeguard against API returning 0 for ticks (Prevents DivisionByZero crash)
-                            if float(p_tick) == 0 or float(s_tick) == 0:
-                                logging.warning(f"[SYNC] Skiping {coin}: Exchange returned 0 for tick size.")
+                            # Strict fallback for missing precision rules to prevent division by zero
+                            if not p_tick or float(p_tick) == 0: p_tick = "100000000000000"  # Fallback to standard tick
+                            if not s_tick or float(s_tick) == 0: s_tick = "1000000000000000" 
+                            if pid is None:
+                                logging.warning(f"[SYNC] Skipping {coin} because product_id is None.")
                                 continue
 
                             self.product_map[coin] = {
                                 "id": int(pid), 
-                                "p_tick_x18": Decimal(str(p_tick) if p_tick else "0"), 
-                                "s_tick_x18": Decimal(str(s_tick) if s_tick else "0"),
+                                "p_tick_x18": Decimal(str(p_tick)), 
+                                "s_tick_x18": Decimal(str(s_tick)),
                                 "min_usd": float(Decimal(str(m_size) if m_size else "0") / Decimal("1e18"))
                             }
                             count += 1
@@ -145,8 +190,15 @@ class NadoQuantBot:
                     logging.info(f"[SYNC] Mapped assets: {list(self.product_map.keys())}")
                     return True  # This successfully breaks the while loop!
                 else:
-                    logging.warning(f"[SYNC] No allowed coins found! Response type: {type(res)}")
-                    logging.warning(f"[SYNC] Symbols seen from Nado API: {seen_symbols[:20]}")
+                    logging.warning(f"[SYNC] 🚨 NO ALLOWED COINS MATCHED!")
+                    logging.warning(f"[SYNC] We are looking for: {ALLOWED_COINS}")
+                    logging.warning(f"[SYNC] The API returned these {len(seen_symbols)} symbols: {seen_symbols[:30]}...")
+                    
+                    # Print exact attribute names of the first item to debug missing fields
+                    if isinstance(first_product, dict):
+                        logging.warning(f"[SYNC] Object structure: {list(first_product.keys())}")
+                    else:
+                        logging.warning(f"[SYNC] Object structure: {[attr for attr in dir(first_product) if not attr.startswith('_')]}")
                         
             except Exception as e:
                 logging.error(f"[SYNC] Error: {e}")
@@ -267,7 +319,7 @@ class NadoQuantBot:
             data = await self.signal_queue.get()
             try:
                 trader = data.get("trader_address")
-                raw_pos = data.get("data", {}).get("clearinghouseState", {}).get("assetPositions", [])
+                raw_pos = data.get("data", {}).get("clearinghouseState", {}).get("assetPositions",[])
                 
                 new_state = {p["position"]["coin"]: float(p["position"]["szi"]) for p in raw_pos if float(p["position"]["szi"]) != 0}
                 old_state = self.trader_positions.get(trader, {})
