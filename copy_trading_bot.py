@@ -1,4 +1,4 @@
-import asyncio, aiohttp, websockets, json, logging, os, signal, time, sys, warnings
+import asyncio, aiohttp, websockets, json, logging, os, signal, sys, warnings
 from logging.handlers import RotatingFileHandler
 from decimal import Decimal, ROUND_DOWN
 from dotenv import load_dotenv
@@ -89,28 +89,68 @@ class NadoQuantBot:
             try:
                 logging.info("[SYNC] Fetching Perpetual IDs and Ticks from Nado...")
                 res = await asyncio.to_thread(self.client.context.engine_client.get_all_products)
-                perps = getattr(res, 'perp_products',[])
+                
+                # Dynamically handle the response whether it's a List, Dict, or Object
+                perps =[]
+                if isinstance(res, list):
+                    perps = res
+                elif isinstance(res, dict):
+                    perps = res.get('perp_products', res.get('products', res.get('data',[])))
+                else:
+                    perps = getattr(res, 'perp_products', getattr(res, 'products', getattr(res, 'data',[])))
                 
                 count = 0
+                seen_symbols =[]
+                
                 for p in perps:
-                    symbol = str(getattr(p, 'symbol', '')).upper()
-                    if symbol.endswith('-PERP'):
-                        coin = symbol.split('-')[0]
-                        if coin in ALLOWED_COINS:
-                            pid = getattr(p, 'product_id', None)
-                            if pid is not None:
-                                self.product_map[coin] = {
-                                    "id": int(pid), 
-                                    "p_tick_x18": Decimal(str(getattr(p, 'price_increment_x18', 0))), 
-                                    "s_tick_x18": Decimal(str(getattr(p, 'base_tick_x18', 0))),
-                                    "min_usd": float(Decimal(str(getattr(p, 'min_size', 0))) / Decimal("1e18"))
-                                }
-                                count += 1
+                    # Dynamically extract fields whether the item is a Dict or Object
+                    if isinstance(p, dict):
+                        symbol = str(p.get('symbol', p.get('name', ''))).upper()
+                        pid = p.get('product_id', p.get('id', p.get('productId')))
+                        p_tick = p.get('price_increment_x18', p.get('priceIncrementX18', 0))
+                        s_tick = p.get('base_tick_x18', p.get('baseTickX18', 0))
+                        m_size = p.get('min_size', p.get('minSize', 0))
+                    else:
+                        symbol = str(getattr(p, 'symbol', getattr(p, 'name', ''))).upper()
+                        pid = getattr(p, 'product_id', getattr(p, 'id', getattr(p, 'productId', None)))
+                        p_tick = getattr(p, 'price_increment_x18', getattr(p, 'priceIncrementX18', 0))
+                        s_tick = getattr(p, 'base_tick_x18', getattr(p, 'baseTickX18', 0))
+                        m_size = getattr(p, 'min_size', getattr(p, 'minSize', 0))
+
+                    if symbol:
+                        seen_symbols.append(symbol)
+                        
+                    # Forgiving coin matching (removes -PERP, /USD, etc.)
+                    coin = symbol.replace('-PERP', '').replace('/USD', '').replace('PERP', '').replace('-USDT', '')
+                    
+                    if coin in ALLOWED_COINS and pid is not None:
+                        try:
+                            # Safeguard against API returning 0 for ticks (Prevents DivisionByZero crash)
+                            if float(p_tick) == 0 or float(s_tick) == 0:
+                                logging.warning(f"[SYNC] Skiping {coin}: Exchange returned 0 for tick size.")
+                                continue
+
+                            self.product_map[coin] = {
+                                "id": int(pid), 
+                                "p_tick_x18": Decimal(str(p_tick) if p_tick else "0"), 
+                                "s_tick_x18": Decimal(str(s_tick) if s_tick else "0"),
+                                "min_usd": float(Decimal(str(m_size) if m_size else "0") / Decimal("1e18"))
+                            }
+                            count += 1
+                        except Exception as parse_err:
+                            logging.error(f"[SYNC] Failed to parse math for {coin}: {parse_err}")
+                        
                 if count > 0:
-                    logging.info(f"[SYNC] Success: {count} Nado assets strictly mapped via Context API.")
-                    return True
+                    logging.info(f"[SYNC] Success: {count} Nado assets strictly mapped.")
+                    logging.info(f"[SYNC] Mapped assets: {list(self.product_map.keys())}")
+                    return True  # This successfully breaks the while loop!
+                else:
+                    logging.warning(f"[SYNC] No allowed coins found! Response type: {type(res)}")
+                    logging.warning(f"[SYNC] Symbols seen from Nado API: {seen_symbols[:20]}")
+                        
             except Exception as e:
                 logging.error(f"[SYNC] Error: {e}")
+                
             await asyncio.sleep(10)
 
     def _extract_traders(self, obj, container):
@@ -142,7 +182,7 @@ class NadoQuantBot:
                                 if roi_val is None: roi_val = t.get("roi")
                                 if roi_val is None: roi_val = 0
                                 
-                                try: processed[addr] = float(roi_val) # FIXED: NoneType crashes
+                                try: processed[addr] = float(roi_val)
                                 except (ValueError, TypeError): processed[addr] = 0.0
                                     
                         ranked = sorted(processed.items(), key=lambda x: x[1], reverse=True)
@@ -164,14 +204,14 @@ class NadoQuantBot:
                                 del self.trader_ws_tasks[t]
                                 
                         logging.info(f"[TRACKER] Monitoring {len(self.tracked_traders)} Pro Traders.")
-            except Exception as e: pass 
+            except Exception: pass 
             await asyncio.sleep(300)
 
     async def trader_ws_loop(self, trader: str):
         uri = "wss://api.hyperliquid.xyz/ws"
         while self.running and trader in self.tracked_traders:
             try:
-                # FIXED: Included both RFC standard pings and Hyperliquid specific application-level pings
+                # Included both RFC standard pings and Hyperliquid specific application-level pings
                 async with websockets.connect(uri, ping_interval=20, ping_timeout=20) as ws:
                     await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "webData2", "user": trader}}))
                     
@@ -196,37 +236,38 @@ class NadoQuantBot:
                         ping_task.cancel()
             except asyncio.CancelledError:
                 break # Task gracefully cancelled
-            except Exception as e:
+            except Exception:
                 if self.running: await asyncio.sleep(5)
 
     async def handle_signal(self, coin: str, old_dir: int, new_dir: int, trader: str):
-        # Step 1: Execute close if we currently mirror THIS trader on THIS coin.
-        # FIXED: Stops cross-contamination bugs (closing someone else's mirror).
-        if coin in self.bot_state["positions"]:
-            if self.bot_state["positions"][coin]["trader"] == trader:
-                logging.info(f"[SIGNAL] {trader[:6]} closing/flipping {coin}...")
-                await self.execute_nado_order(coin, is_buy=False, trader=trader, is_close=True)
-            elif old_dir != 0:
-                return # Ignored: Trader closed a position, but we are mirroring this asset from someone else.
-                
-        # Step 2: Open logically if they establish a new direction
-        # FIXED: Flips (Long -> Short) are now successfully caught because Step 1 executes first.
-        if new_dir != 0:
-            if coin not in self.bot_state["positions"] and coin not in self.locked_coins:
-                self.locked_coins.add(coin) # Concurrency protection lock
-                try:
-                    is_buy = (new_dir == 1)
-                    logging.info(f"[SIGNAL] {trader[:6]} opening {coin} ({'LONG' if is_buy else 'SHORT'})...")
-                    await self.execute_nado_order(coin, is_buy=is_buy, trader=trader, is_close=False)
-                finally:
-                    self.locked_coins.discard(coin)
+        try:
+            # Step 1: Execute close if we currently mirror THIS trader on THIS coin.
+            if coin in self.bot_state["positions"]:
+                if self.bot_state["positions"][coin]["trader"] == trader:
+                    logging.info(f"[SIGNAL] {trader[:6]} closing/flipping {coin}...")
+                    await self.execute_nado_order(coin, is_buy=False, trader=trader, is_close=True)
+                elif old_dir != 0:
+                    return # Ignored: Trader closed a position, but we are mirroring this asset from someone else.
+                    
+            # Step 2: Open logically if they establish a new direction
+            if new_dir != 0:
+                if coin not in self.bot_state["positions"] and coin not in self.locked_coins:
+                    self.locked_coins.add(coin) # Concurrency protection lock
+                    try:
+                        is_buy = (new_dir == 1)
+                        logging.info(f"[SIGNAL] {trader[:6]} opening {coin} ({'LONG' if is_buy else 'SHORT'})...")
+                        await self.execute_nado_order(coin, is_buy=is_buy, trader=trader, is_close=False)
+                    finally:
+                        self.locked_coins.discard(coin)
+        except Exception as e:
+            logging.error(f"[PROCESS] Error handling signal for {coin}: {e}")
 
     async def process_loop(self):
         while self.running:
             data = await self.signal_queue.get()
             try:
                 trader = data.get("trader_address")
-                raw_pos = data.get("data", {}).get("clearinghouseState", {}).get("assetPositions",[])
+                raw_pos = data.get("data", {}).get("clearinghouseState", {}).get("assetPositions", [])
                 
                 new_state = {p["position"]["coin"]: float(p["position"]["szi"]) for p in raw_pos if float(p["position"]["szi"]) != 0}
                 old_state = self.trader_positions.get(trader, {})
@@ -238,7 +279,7 @@ class NadoQuantBot:
                     old_dir = 1 if old_szi > 0 else (-1 if old_szi < 0 else 0)
                     new_dir = 1 if new_szi > 0 else (-1 if new_szi < 0 else 0)
                     
-                    # FIXED: Dispatch as an async task to prevent queue blocking and slippage
+                    # Dispatch as an async task to prevent queue blocking and slippage
                     if old_dir != new_dir:
                         asyncio.create_task(self.handle_signal(coin, old_dir, new_dir, trader))
                         
@@ -269,10 +310,10 @@ class NadoQuantBot:
                 target_px_x18 = Decimal(str(mark_px_x18)) * Decimal("1.10" if is_buy else "0.90")
                 final_px_x18 = (target_px_x18 / market["p_tick_x18"]).quantize(Decimal('1'), rounding=ROUND_DOWN) * market["p_tick_x18"]
                 
-                # FIXED: Uses identical qty_x18 logged from opening the trade so there are zero orphaned decimal dustings
+                # Uses identical qty_x18 logged from opening the trade so there are zero orphaned decimal dustings
                 qty_x18 = pos_data.get("qty_x18")
                 
-                if not qty_x18: # Fallback backwards compatibility just in case older state.json formats exist
+                if not qty_x18: # Fallback backwards compatibility
                     sub_info = await asyncio.to_thread(self.client.context.engine_client.get_subaccount_info, self.subaccount_hex)
                     iso_res = await asyncio.to_thread(self.client.context.engine_client.get_isolated_positions, self.subaccount_hex)
                     manager = MarginManager(sub_info, getattr(iso_res, 'isolated_positions',[]))
@@ -351,7 +392,7 @@ async def main():
     # Graceful Mac & Linode Unix compatibility check
     for sig in (signal.SIGINT, signal.SIGTERM): 
         try: loop.add_signal_handler(sig, stop.set)
-        except NotImplementedError: pass # Windows silent fallback if you test locally
+        except NotImplementedError: pass # Windows silent fallback if tested locally
         
     t = asyncio.create_task(bot.run())
     await stop.wait()
