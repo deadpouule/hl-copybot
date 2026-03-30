@@ -27,7 +27,7 @@ DATA_ENV_STR = os.getenv("DATA_ENV", "nadoMainnet")
 
 TOP_X_TRADERS = 30 
 ALLOWED_COINS = ["BTC", "ETH", "SOL", "BNB", "PAX", "XAG", "WTI", "HYPE"]
-RISK_POS_PCT = 0.10        # 10% of margin per trade
+RISK_POS_PCT = 0.10        # 10% per trade
 MIN_ORDER_USD = 11.0       
 
 os.makedirs("logs", exist_ok=True)
@@ -42,7 +42,7 @@ class NadoQuantBot:
             self.owner = self.signer.address
             logging.info(f"Signer active: {self.owner}")
         except Exception as e:
-            logging.error(f"Signer Error: {e}"); sys.exit(1)
+            logging.error(f"PK error: {e}"); sys.exit(1)
 
         mode = NadoClientMode.MAINNET if DATA_ENV_STR == "nadoMainnet" else NadoClientMode.TESTNET
         self.client = create_nado_client(mode, self.signer)
@@ -64,69 +64,67 @@ class NadoQuantBot:
         self.signal_queue = asyncio.Queue()
         self.running = False
         
-        # PRE-LOADED PERP IDs: Correct for Nado Mainnet (ID 1 is Spot, ID 2+ are Perps)
+        # 3. VERIFIED DEFAULTS: BTC=2, ETH=3 (Perps IDs for Nado)
         self.product_map = {
-            "BTC": {"id": 2, "p_tick": Decimal("0.1"), "s_tick": Decimal("0.00001"), "status": "live"},
-            "ETH": {"id": 3, "p_tick": Decimal("0.01"), "s_tick": Decimal("0.0001"), "status": "live"},
-            "SOL": {"id": 4, "p_tick": Decimal("0.001"), "s_tick": Decimal("0.01"), "status": "live"},
-            "BNB": {"id": 5, "p_tick": Decimal("0.01"), "s_tick": Decimal("0.001"), "status": "live"},
-            "HYPE": {"id": 100, "p_tick": Decimal("0.001"), "s_tick": Decimal("0.01"), "status": "live"}
+            "BTC": {"id": 2, "p_tick": Decimal("0.1"), "s_tick": Decimal("0.00001"), "min_s": Decimal("0.00001")},
+            "ETH": {"id": 3, "p_tick": Decimal("0.01"), "s_tick": Decimal("0.0001"), "min_s": Decimal("0.0001")},
+            "SOL": {"id": 4, "p_tick": Decimal("0.001"), "s_tick": Decimal("0.01"), "min_s": Decimal("0.01")},
+            "BNB": {"id": 5, "p_tick": Decimal("0.01"), "s_tick": Decimal("0.01"), "min_s": Decimal("0.01")},
+            "HYPE": {"id": 100, "p_tick": Decimal("0.001"), "s_tick": Decimal("0.1"), "min_s": Decimal("0.1")}
         }
 
     def load_state(self):
         if os.path.exists(self.state_file):
             try:
                 with open(self.state_file, "r") as f: self.bot_state = json.load(f)
-                logging.info(f"Memory: Loaded {len(self.bot_state['positions'])} active mirrors.")
+                logging.info(f"Memory: Loaded {len(self.bot_state['positions'])} mirrors.")
             except: pass
 
     def save_state(self):
         with open(self.state_file, "w") as f: json.dump(self.bot_state, f)
 
     async def sync_nado_memory(self):
-        """Wipes memory of trades YOU closed manually on the website."""
         while self.running:
             try:
                 sub_info = await asyncio.to_thread(self.client.context.engine_client.get_subaccount_info, self.subaccount_hex)
                 live_coins = {str(getattr(p, 'symbol', '')).split('-')[0].upper() for p in getattr(sub_info, 'perp_positions', []) if abs(float(getattr(p, 'amount', 0))) > 1e-5}
                 to_clear = [c for c in self.bot_state["positions"].keys() if c not in live_coins]
                 for c in to_clear:
-                    logging.info(f"Manual Closure Found: Removing {c} from memory.")
+                    logging.info(f"Sync: {c} position cleared on exchange. Cleaning memory.")
                     del self.bot_state["positions"][c]
                 if to_clear: self.save_state()
             except: pass
             await asyncio.sleep(30)
 
     async def sync_market_data(self):
-        """Background Sync: Constantly verifies IDs and Rules."""
+        """Discovers rules and ensures x18 strings are converted to standard decimals."""
         while self.running:
             try:
-                res = await asyncio.to_thread(self.client.context.engine_client.get_all_products)
-                perps = getattr(res, 'perp_products', [])
-                for p in perps:
-                    sym = str(getattr(p, 'symbol', '')).upper()
-                    if sym.endswith('-PERP'):
-                        coin = sym.split('-')[0]
-                        if coin in ALLOWED_COINS:
-                            pid = getattr(p, 'product_id', None)
-                            p_tick = float(getattr(p, 'price_increment_x18', 0)) / 1e18
-                            s_tick = float(getattr(p, 'base_tick_x18', 0)) / 1e18
-                            if pid and p_tick > 0:
-                                self.product_map[coin] = {
-                                    "id": int(pid), "p_tick": Decimal(str(p_tick)), 
-                                    "s_tick": Decimal(str(s_tick)), 
-                                    "status": getattr(p, 'trading_status', 'live')
-                                }
+                url = "https://gateway.prod.nado.xyz/v1/symbols"
+                async with self.session.get(url, timeout=10) as r:
+                    if r.status == 200:
+                        symbols = await r.json()
+                        for s in symbols:
+                            if s.get('type') == 'perp':
+                                sym_name = str(s.get('symbol', '')).upper()
+                                coin = sym_name.split('-')[0]
+                                if coin in ALLOWED_COINS:
+                                    # SCALE FIX: Always divide strings by 1e18
+                                    p_tick = Decimal(s.get('price_increment_x18', '0')) / Decimal("1e18")
+                                    s_tick = Decimal(s.get('size_increment', '0')) / Decimal("1e18")
+                                    min_s = Decimal(s.get('min_size', '0')) / Decimal("1e18")
+                                    
+                                    if p_tick > 0:
+                                        self.product_map[coin] = {
+                                            "id": int(s.get('product_id')), "p_tick": p_tick, 
+                                            "s_tick": s_tick, "status": s.get('trading_status', 'live'),
+                                            "min_s": min_s if min_s > 0 else s_tick
+                                        }
             except: pass
             await asyncio.sleep(600)
 
-    async def heartbeat(self):
-        while self.running:
-            logging.info(f"[HEARTBEAT] Active. Monitoring {len(self.tracked_traders)} traders. Memory: {len(self.bot_state['positions'])} open.")
-            await asyncio.sleep(60)
-
     async def orderly_mids_loop(self):
-        """Maintain live prices from Nado."""
+        """Maintain live prices from Nado with STRICT symbol matching."""
         while self.running:
             try:
                 async with self.session.get("https://api-evm.orderly.org/v1/public/futures") as r:
@@ -134,9 +132,10 @@ class NadoQuantBot:
                         js = await r.json()
                         for row in js.get("data", {}).get("rows", []):
                             symbol = row.get("symbol", "").upper()
-                            if symbol.endswith("-PERP") or symbol.startswith("PERP_"):
-                                coin = symbol.replace("PERP_", "").replace("-PERP", "").split("_")[0]
-                                if coin in ALLOWED_COINS: self.orderly_prices[coin] = float(row.get("mark_price", 0))
+                            if symbol.endswith("-PERP"):
+                                coin = symbol.split("-")[0]
+                                if coin in ALLOWED_COINS:
+                                    self.orderly_prices[coin] = float(row.get("mark_price", 0))
             except: pass
             await asyncio.sleep(5)
 
@@ -153,23 +152,16 @@ class NadoQuantBot:
             except: await asyncio.sleep(5)
 
     async def leaderboard_loop(self):
-        """Scrapes ALL traders and picks the Top 30 without strict ROI filters."""
         while self.running:
             try:
                 async with self.session.get("https://stats-data.hyperliquid.xyz/Mainnet/leaderboard") as r:
                     if r.status == 200:
                         data = await r.json()
                         raw = []; self._extract_greedy(data, raw)
-                        processed = {}
-                        for t in raw:
-                            addr = t.get("account") or t.get("user") or t.get("ethAddress")
-                            roi = float(t.get("roiWeek", t.get("roi", 0)))
-                            if addr and (addr not in processed or roi > processed[addr]): processed[addr] = roi
-                        
+                        processed = { (t.get("account") or t.get("user") or t.get("ethAddress")): float(t.get("roiWeek", t.get("roi", 0))) for t in raw if (t.get("account") or t.get("user") or t.get("ethAddress")) }
                         ranked = sorted(processed.items(), key=lambda x: x[1], reverse=True)
                         top = {r[0] for r in ranked[:TOP_X_TRADERS]}
                         for p in self.bot_state["positions"].values(): top.add(p["trader"])
-                        
                         new = top - self.tracked_traders; old = self.tracked_traders - top
                         self.tracked_traders = top
                         for t in new: self.trader_ws_tasks[t] = asyncio.create_task(self.trader_ws_loop(t))
@@ -180,7 +172,6 @@ class NadoQuantBot:
             await asyncio.sleep(300)
 
     def _extract_greedy(self, obj, container):
-        """Deep recursive search for trader objects."""
         if isinstance(obj, dict):
             u = obj.get("account") or obj.get("user") or obj.get("ethAddress") or obj.get("address")
             if u and isinstance(u, str) and u.startswith("0x") and len(u) > 30: container.append(obj)
@@ -195,11 +186,12 @@ class NadoQuantBot:
                 async with websockets.connect(uri) as ws:
                     await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "webData2", "user": trader}}))
                     async for msg in ws:
-                        if not self.running: break
+                        if not self.running or trader not in self.tracked_traders: break
                         data = json.loads(msg)
                         if data.get("channel") == "webData2":
                             data["trader_address"] = trader; await self.signal_queue.put(data)
-            except: await asyncio.sleep(5)
+            except:
+                if self.running: await asyncio.sleep(5)
 
     async def process_loop(self):
         while self.running:
@@ -209,20 +201,19 @@ class NadoQuantBot:
                 raw_pos = data.get("data", {}).get("clearinghouseState", {}).get("assetPositions", [])
                 new_s = {p["position"]["coin"]: float(p["position"]["szi"]) for p in raw_pos if float(p["position"]["szi"]) != 0}
                 
-                if trader not in self.trader_positions:
-                    self.trader_positions[trader] = new_s
-                    continue
-
+                # INSTANT STRIKE: removed baseline delay
                 old_s = self.trader_positions.get(trader, {})
                 for c, s in new_s.items():
                     if c not in old_s and c.upper() in ALLOWED_COINS:
                         logging.info(f"SIGNAL: {trader[:6]} opened {c}")
                         await self.execute_nado_order(c, s > 0, trader, False)
+                        await asyncio.sleep(1) # Burst protection
                 for c in old_s.keys():
                     if c not in new_s and c.upper() in ALLOWED_COINS:
                         if c in self.bot_state["positions"]:
                             logging.info(f"SIGNAL: {trader[:6]} closed {c}")
                             await self.execute_nado_order(c, False, trader, True)
+                            await asyncio.sleep(1)
                 self.trader_positions[trader] = new_s
             finally: self.signal_queue.task_done()
 
@@ -250,6 +241,7 @@ class NadoQuantBot:
         if not market: return
 
         try:
+            # 1. Oracle Price
             px = self.orderly_prices.get(coin.upper(), 0.0) or float(self.all_mids.get(coin.upper(), 0.0))
             if px == 0: return
 
@@ -261,20 +253,24 @@ class NadoQuantBot:
             final_px_dec = self._round_step(target, market["p_tick"])
             available = await self._get_available_margin()
             usd_amt = max(available * RISK_POS_PCT, MIN_ORDER_USD)
-            if available < usd_amt and not is_close: return
+            if available < usd_amt and not is_close:
+                logging.info(f"Balance check for {coin}: Margin too low (${available:.2f})")
+                return
             
             qty_dec = self._round_step(usd_amt / px, market["s_tick"])
-            if qty_dec <= 0: qty_dec = market["s_tick"] * 10 
+            if qty_dec < market["min_s"]: qty_dec = market["min_s"]
 
-            amt_x18 = int((qty_dec * Decimal("1e18")).to_integral_value())
-            if not is_buy: amt_x18 = -amt_x18
-            px_x18 = int((final_px_dec * Decimal("1e18")).to_integral_value())
+            # Construct EXACT X18 Parameters
+            amount_x18 = int((qty_dec * Decimal("1e18")).to_integral_value())
+            if not is_buy: amount_x18 = -amount_x18
+            price_x18 = int((final_px_dec * Decimal("1e18")).to_integral_value())
 
             order_exec = OrderType.IOC
-            if str(market.get("status", "")).lower() == "post_only": order_exec = OrderType.POST_ONLY
+            if str(market.get("status", "")).lower() == "post_only" or coin.upper() == "HYPE":
+                order_exec = OrderType.POST_ONLY
 
             order = OrderParams(
-                sender=self.subaccount_hex, priceX18=px_x18, amount=amt_x18,
+                sender=self.subaccount_hex, priceX18=price_x18, amount=amount_x18,
                 expiration=get_expiration_timestamp(60), nonce=gen_order_nonce(),
                 appendix=build_appendix(order_type=order_exec, reduce_only=is_close)
             )
@@ -283,10 +279,10 @@ class NadoQuantBot:
             res = await asyncio.to_thread(self.client.market.place_order, PlaceOrderParams(product_id=market["id"], order=order))
             
             if "success" in str(res).lower():
-                logging.info(f"NADO SUCCESS: {coin} mirrored.")
+                logging.info(f"NADO SUCCESS: {coin} Trade Complete.")
                 if is_close: del self.bot_state["positions"][coin]
                 else: self.bot_state["positions"][coin] = {"trader": trader, "is_buy": is_buy}
-                self.save_state()
+                self.save_state(); self.last_funds_check = 0
             else: logging.error(f"NADO REJECTED: {getattr(res, 'message', str(res))}")
         except Exception as e: logging.error(f"Failure: {e}")
 
@@ -297,7 +293,6 @@ class NadoQuantBot:
         asyncio.create_task(self.orderly_mids_loop())
         asyncio.create_task(self.leaderboard_loop())
         asyncio.create_task(self.sync_nado_memory()) 
-        asyncio.create_task(self.heartbeat())
         await self.process_loop()
 
     async def close(self):
@@ -311,8 +306,8 @@ class NadoQuantBot:
 async def main():
     bot = NadoQuantBot(); loop = asyncio.get_running_loop(); stop = asyncio.Event()
     for sig in (signal.SIGINT, signal.SIGTERM): loop.add_signal_handler(sig, stop.set)
-    t = asyncio.create_task(bot.run()); await stop.wait(); await bot.close(); t.cancel()
+    t = asyncio.create_task(bot.run()); await stop.wait(); await bot.close(); bt.cancel()
 
 if __name__ == "__main__":
     try: asyncio.run(main())
-    except KeyboardInterrupt: pass
+    except: pass
