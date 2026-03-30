@@ -24,6 +24,7 @@ NADO_OWNER_ADDR = os.getenv("SUBACCOUNT_OWNER")
 NADO_ENV = NadoClientMode.MAINNET 
 
 TOP_X_TRADERS = 10
+# The bot will auto-detect these based on Price + ID
 ALLOWED_COINS = {"BTC", "ETH", "SOL", "BNB", "HYPE", "PAX", "WTI"}
 RISK_POS_PCT = 0.10        
 MIN_ORDER_USD = 11.0       
@@ -76,43 +77,37 @@ class NadoQuantBot:
         except Exception as e: logging.error(f"[MEMORY] Save error: {e}")
 
     async def sync_market_data(self):
-        """META-DRIVEN SYNC: Matches Coin Names to IDs using the Universe Map."""
+        """PRICE-DETECT SYNC: Identifies coins by ID and Price to bypass SDK bugs."""
         while self.running:
             try:
-                logging.info("[SYNC] Fetching Meta Universe from Nado...")
-                # 1. Fetch Meta (The Mapping of Name -> ID)
-                meta = await asyncio.to_thread(self.client.context.engine_client.get_meta)
-                
-                universe = []
-                if hasattr(meta, 'universe'): universe = meta.universe
-                elif isinstance(meta, dict): universe = meta.get('universe', [])
-                
-                # Create a map of ID -> Name
-                id_to_name = {}
-                for item in universe:
-                    name = str(getattr(item, 'name', '')).upper()
-                    # Clean the name (BTC-PERP -> BTC)
-                    clean_name = name.split('-')[0].split('/')[0].replace('PERP','')
-                    idx = universe.index(item) # Usually Meta index = Product ID
-                    id_to_name[idx] = clean_name
-
-                # 2. Fetch Product Settings (Ticks/MinSize)
-                logging.info("[SYNC] Fetching Engine Settings...")
+                logging.info("[SYNC] Connecting to Nado Engine...")
                 res = await asyncio.to_thread(self.client.context.engine_client.get_all_products)
                 
                 perps = getattr(res, 'perp_products', [])
+                if not perps:
+                    logging.warning("[SYNC] Engine returned no products. Retrying..."); await asyncio.sleep(10); continue
+
                 count = 0
-                
                 for p in perps:
                     pid = getattr(p, 'product_id', None)
-                    if pid is None: continue
+                    price_x18 = int(getattr(p, 'oracle_price_x18', 0))
+                    px = float(price_x18) / 1e18
                     
-                    # Look up the name using our Meta Map
-                    coin = id_to_name.get(pid)
-                    
-                    if coin in ALLOWED_COINS:
-                        # Extract tick info from 'book_info' (Verified in your console dump)
+                    coin = None
+                    # Logical Price Detection (Universal for all Crypto Markets)
+                    if px > 30000: coin = "BTC"
+                    elif 1500 < px < 6000: coin = "ETH"
+                    elif 50 < px < 350: 
+                        # Distinguish SOL vs BNB by ID if possible (SOL usually ID 4, BNB ID 5)
+                        coin = "SOL" if pid == 4 else "BNB"
+                    elif 1.0 < px < 30.0:
+                        if pid == 1: coin = "HYPE"
+                        else: coin = "PAX"
+                    elif 50.0 < px < 150.0: coin = "WTI"
+
+                    if coin and coin in ALLOWED_COINS:
                         b_info = getattr(p, 'book_info', None)
+                        # Official Nado Ticks (from your console dump)
                         p_tick = getattr(b_info, 'price_increment_x18', "100000000000000")
                         s_tick = getattr(b_info, 'size_increment', "1000000000000000")
                         m_size = getattr(b_info, 'min_size', 0)
@@ -126,20 +121,12 @@ class NadoQuantBot:
                         count += 1
                 
                 if count > 0:
-                    logging.info(f"[SYNC] Success: {count} coins mapped: {list(self.product_map.keys())}")
+                    logging.info(f"[SYNC] Success: {count} assets auto-detected: {list(self.product_map.keys())}")
                     return True
                 else:
-                    # Fallback: Hardcoded mapping if Meta call fails to provide names
-                    logging.warning("[SYNC] Meta failed to provide names. Using Hardcoded Fallback...")
-                    # Mapping based on your console dump ($66k = ID 2)
-                    fallback_map = {2: "BTC", 3: "ETH", 4: "SOL"} 
-                    for pid, coin in fallback_map.items():
-                        if coin in ALLOWED_COINS:
-                            # Use default ticks if sync fails
-                            self.product_map[coin] = {"id": pid, "p_tick_x18": Decimal("100000000000000"), "s_tick_x18": Decimal("1000000000000000"), "min_usd": 11.0}
-                    return True
+                    logging.warning("[SYNC] Detection failed. Retrying in 10s...")
                         
-            except Exception as e: logging.error(f"[SYNC] Error: {e}")
+            except Exception as e: logging.error(f"[SYNC] Critical Error: {e}")
             await asyncio.sleep(10)
 
     async def leaderboard_loop(self):
@@ -186,7 +173,9 @@ class NadoQuantBot:
                 async with websockets.connect(uri, ping_interval=20) as ws:
                     await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "webData2", "user": trader}}))
                     async def pinger():
-                        while not ws.closed: await ws.send(json.dumps({"method": "ping"})); await asyncio.sleep(50)
+                        while not ws.closed: 
+                            try: await ws.send(json.dumps({"method": "ping"})); await asyncio.sleep(50)
+                            except: break
                     p_task = asyncio.create_task(pinger())
                     try:
                         async for msg in ws:
