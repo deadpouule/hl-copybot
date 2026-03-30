@@ -16,7 +16,7 @@ from nado_protocol.utils.order import build_appendix
 from nado_protocol.utils.bytes32 import subaccount_to_hex
 from nado_protocol.utils.margin_manager import MarginManager
 
-# Suppress harmless eth-utils warnings
+# Suppress harmless warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="eth_utils")
 
 # ==================== CONFIGURATION ====================
@@ -25,7 +25,6 @@ NADO_PK = os.getenv("PRIVATE_KEY")
 NADO_OWNER_ADDR = os.getenv("SUBACCOUNT_OWNER")
 DATA_ENV_STR = os.getenv("DATA_ENV", "nadoMainnet")
 
-# HIGH ACTIVITY SETTINGS
 TOP_X_TRADERS = 30 
 ALLOWED_COINS = ["BTC", "ETH", "SOL", "BNB", "PAX", "XAG", "WTI", "HYPE"]
 RISK_POS_PCT = 0.10        
@@ -37,7 +36,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 class NadoQuantBot:
     def __init__(self):
-        logging.info("Initializing Rate-Limit Proof Nado Engine...")
+        logging.info("Initializing Instant-Start Nado Engine...")
         try:
             self.signer = Account.from_key(NADO_PK)
             self.owner = self.signer.address
@@ -56,7 +55,6 @@ class NadoQuantBot:
         self.orderly_prices = {}
         self.all_mids = {}
         
-        # RATE LIMIT CACHE
         self.cached_summary = None
         self.last_summary_time = 0
         
@@ -66,55 +64,49 @@ class NadoQuantBot:
         self.signal_queue = asyncio.Queue()
         self.running = False
         
+        # VERIFIED FALLBACKS: To ensure bot is "Armed" even before Sync finishes
         self.product_map = {
             "BTC": {"id": 1, "p_tick": Decimal("0.1"), "s_tick": Decimal("0.00001"), "status": "live"},
             "ETH": {"id": 2, "p_tick": Decimal("0.01"), "s_tick": Decimal("0.0001"), "status": "live"},
             "SOL": {"id": 3, "p_tick": Decimal("0.001"), "s_tick": Decimal("0.01"), "status": "live"},
-            "BNB": {"id": 4, "p_tick": Decimal("0.01"), "s_tick": Decimal("0.001"), "status": "live"},
-            "HYPE": {"id": 100, "p_tick": Decimal("0.001"), "s_tick": Decimal("0.01"), "status": "live"},
-            "PAX": {"id": 12, "p_tick": Decimal("0.1"), "s_tick": Decimal("0.001"), "status": "live"},
-            "XAG": {"id": 11, "p_tick": Decimal("0.01"), "s_tick": Decimal("0.01"), "status": "live"},
-            "WTI": {"id": 10, "p_tick": Decimal("0.01"), "s_tick": Decimal("0.1"), "status": "live"}
+            "HYPE": {"id": 100, "p_tick": Decimal("0.001"), "s_tick": Decimal("0.01"), "status": "live"}
         }
 
     def load_state(self):
         if os.path.exists(self.state_file):
             try:
                 with open(self.state_file, "r") as f: self.bot_state = json.load(f)
-                logging.info(f"Memory: Loaded {len(self.bot_state['positions'])} mirrors.")
             except: pass
 
     def save_state(self):
         with open(self.state_file, "w") as f: json.dump(self.bot_state, f)
 
-    async def sync_nado_memory(self):
+    async def heartbeat(self):
+        """Proof of life log every 60 seconds."""
         while self.running:
-            try:
-                sub_info = await asyncio.to_thread(self.client.context.engine_client.get_subaccount_info, self.subaccount_hex)
-                live_coins = {str(p.symbol).split('-')[0].upper() for p in getattr(sub_info, 'perp_positions', []) if abs(float(getattr(p, 'amount', 0))) > 1e-5}
-                to_clear = [c for c in self.bot_state["positions"].keys() if c not in live_coins]
-                for c in to_clear:
-                    logging.info(f"Manual Closure: Removing {c} from bot memory.")
-                    del self.bot_state["positions"][c]
-                if to_clear: self.save_state()
-            except: pass
-            await asyncio.sleep(60) # Reconcile once per minute to save API calls
+            logging.info(f"[HEARTBEAT] Bot Active. Monitoring {len(self.tracked_traders)} traders.")
+            await asyncio.sleep(60)
 
     async def sync_market_data(self):
         while self.running:
             try:
-                res = await asyncio.to_thread(self.client.context.engine_client.get_all_products)
-                perps = getattr(res, 'perp_products', [])
-                for p in perps:
-                    sym = str(getattr(p, 'symbol', '')).upper()
-                    if sym.endswith('-PERP'):
-                        coin = sym.split('-')[0]
-                        if coin in ALLOWED_COINS:
-                            pid = getattr(p, 'product_id', None)
-                            p_tick = float(getattr(p, 'price_increment_x18', 0)) / 1e18
-                            s_tick = float(getattr(p, 'base_tick_x18', 0)) / 1e18
-                            if pid and p_tick > 0:
-                                self.product_map[coin] = {"id": int(pid), "p_tick": Decimal(str(p_tick)), "s_tick": Decimal(str(s_tick)), "status": getattr(p, 'trading_status', 'live')}
+                url = "https://gateway.prod.nado.xyz/v1/symbols"
+                async with self.session.get(url, timeout=10) as r:
+                    if r.status == 200:
+                        symbols = await r.json()
+                        for s in symbols:
+                            sym_name = str(s.get('symbol', '')).upper()
+                            for coin in ALLOWED_COINS:
+                                if coin in sym_name and ("-PERP" in sym_name or "PERP_" in sym_name):
+                                    p_tick = Decimal(s.get('price_increment_x18', '0')) / Decimal("1e18")
+                                    s_tick = Decimal(s.get('size_increment', '0')) / Decimal("1e18")
+                                    if p_tick > 0:
+                                        self.product_map[coin] = {
+                                            "id": int(s.get('product_id')), "p_tick": p_tick, 
+                                            "s_tick": s_tick, "status": s.get('trading_status', 'live'),
+                                            "min_s": Decimal(s.get('min_size', '0')) / Decimal("1e18")
+                                        }
+                        logging.info("Market rule sync complete.")
             except: pass
             await asyncio.sleep(600)
 
@@ -125,11 +117,23 @@ class NadoQuantBot:
                     if r.status == 200:
                         js = await r.json()
                         for row in js.get("data", {}).get("rows", []):
-                            sym = row.get("symbol", "").upper()
-                            coin = sym.replace("PERP_", "").replace("-PERP", "").split("_")[0]
-                            if coin in ALLOWED_COINS: self.orderly_prices[coin] = float(row.get("mark_price", 0))
+                            symbol = row.get("symbol", "").upper()
+                            for coin in ALLOWED_COINS:
+                                if coin in symbol: self.orderly_prices[coin] = float(row.get("mark_price", 0))
             except: pass
             await asyncio.sleep(5)
+
+    async def hl_mids_loop(self):
+        uri = "wss://api.hyperliquid.xyz/ws"
+        while self.running:
+            try:
+                async with websockets.connect(uri) as ws:
+                    await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "allMids"}}))
+                    async for msg in ws:
+                        if not self.running: break
+                        d = json.loads(msg)
+                        if d.get("channel") == "allMids": self.all_mids.update(d["data"]["mids"])
+            except: await asyncio.sleep(5)
 
     async def leaderboard_loop(self):
         while self.running:
@@ -138,7 +142,11 @@ class NadoQuantBot:
                     if r.status == 200:
                         data = await r.json()
                         raw = []; self._extract_greedy(data, raw)
-                        processed = { (t.get("account") or t.get("user") or t.get("ethAddress")): float(t.get("roiWeek", t.get("roi", 0))) for t in raw if (t.get("account") or t.get("user") or t.get("ethAddress")) }
+                        processed = {}
+                        for t in raw:
+                            addr = t.get("account") or t.get("user") or t.get("ethAddress")
+                            roi = float(t.get("roiWeek", t.get("roi", 0)))
+                            if addr and (addr not in processed or roi > processed[addr]): processed[addr] = roi
                         ranked = sorted(processed.items(), key=lambda x: x[1], reverse=True)
                         top = {r[0] for r in ranked[:TOP_X_TRADERS]}
                         for p in self.bot_state["positions"].values(): top.add(p["trader"])
@@ -147,7 +155,7 @@ class NadoQuantBot:
                         for t in new: self.trader_ws_tasks[t] = asyncio.create_task(self.trader_ws_loop(t))
                         for t in old:
                             if t in self.trader_ws_tasks: self.trader_ws_tasks[t].cancel(); del self.trader_ws_tasks[t]
-                        logging.info(f"Following {len(self.tracked_traders)} HL Pro Traders.")
+                        logging.info(f"Following {len(self.tracked_traders)} traders.")
             except: pass
             await asyncio.sleep(300)
 
@@ -157,7 +165,7 @@ class NadoQuantBot:
             if u and isinstance(u, str) and u.startswith("0x") and len(u) > 30: container.append(obj)
             for v in obj.values(): self._extract_greedy(v, container)
         elif isinstance(obj, list):
-            for i in obj: self._extract_traders(i, container)
+            for i in obj: self._extract_greedy(i, container)
 
     async def trader_ws_loop(self, trader: str):
         uri = "wss://api.hyperliquid.xyz/ws"
@@ -196,27 +204,18 @@ class NadoQuantBot:
                 self.trader_positions[trader] = new_s
             finally: self.signal_queue.task_done()
 
-    def _round_step(self, val, step: Decimal) -> Decimal:
-        val_d = Decimal(str(val))
-        return (val_d / step).quantize(Decimal('1'), rounding=ROUND_DOWN) * step
-
     async def _get_available_margin(self):
-        """Rate-Limit Proof: Caches account summary for 5 seconds to handle bursts."""
         now = time.time()
-        if self.cached_summary and (now - self.last_summary_time < 5):
-            return self.cached_summary
-        
+        if self.cached_summary and (now - self.last_summary_time < 5): return self.cached_summary
         try:
             sub_info = await asyncio.to_thread(self.client.context.engine_client.get_subaccount_info, self.subaccount_hex)
             iso_res = await asyncio.to_thread(self.client.context.engine_client.get_isolated_positions, self.subaccount_hex)
             manager = MarginManager(sub_info, getattr(iso_res, 'isolated_positions', []))
             summary = manager.calculate_account_summary()
-            
             self.cached_summary = float(summary.funds_available)
             self.last_summary_time = now
             return self.cached_summary
-        except:
-            return self.cached_summary or 0.0
+        except: return self.cached_summary or 0.0
 
     async def execute_nado_order(self, coin: str, is_buy: bool, trader: str, is_close: bool):
         if not is_close and coin in self.bot_state["positions"]: return
@@ -225,7 +224,7 @@ class NadoQuantBot:
         if not market: return
 
         try:
-            px = self.orderly_prices.get(coin.upper(), 0.0)
+            px = self.orderly_prices.get(coin.upper(), 0.0) or float(self.all_mids.get(coin.upper(), 0.0))
             if px == 0: return
 
             target = px * (1.05 if is_buy else 0.95)
@@ -233,22 +232,20 @@ class NadoQuantBot:
                 is_buy = not self.bot_state["positions"][coin]["is_buy"]
                 target = px * (1.05 if is_buy else 0.95)
 
-            final_px_dec = self._round_step(target, market["p_tick"])
-            
-            # Use cached margin to avoid Error 1000
+            final_px_dec = (Decimal(str(target)) / market["p_tick"]).quantize(Decimal('1'), rounding=ROUND_DOWN) * market["p_tick"]
             available = await self._get_available_margin()
             usd_amt = max(available * RISK_POS_PCT, MIN_ORDER_USD)
             if available < usd_amt and not is_close: return
             
-            qty_dec = self._round_step(usd_amt / px, market["s_tick"])
-            if qty_dec <= 0: qty_dec = market["s_tick"] 
+            qty_dec = (Decimal(str(usd_amt / px)) / market["s_tick"]).quantize(Decimal('1'), rounding=ROUND_DOWN) * market["s_tick"]
+            if qty_dec <= 0: return
 
             amt_x18 = int((qty_dec * Decimal("1e18")).to_integral_value())
             if not is_buy: amt_x18 = -amt_x18
             px_x18 = int((final_px_dec * Decimal("1e18")).to_integral_value())
 
             order_exec = OrderType.IOC
-            if str(market.get("status", "")).lower() == "post_only": order_exec = OrderType.POST_ONLY
+            if market.get("status") == "post_only": order_exec = OrderType.POST_ONLY
 
             order = OrderParams(
                 sender=self.subaccount_hex, priceX18=px_x18, amount=amt_x18,
@@ -260,22 +257,21 @@ class NadoQuantBot:
             res = await asyncio.to_thread(self.client.market.place_order, PlaceOrderParams(product_id=market["id"], order=order))
             
             if "success" in str(res).lower():
-                logging.info(f"NADO SUCCESS: {coin} mirrored.")
+                logging.info(f"NADO SUCCESS: {coin} trade complete.")
                 if is_close: del self.bot_state["positions"][coin]
                 else: self.bot_state["positions"][coin] = {"trader": trader, "is_buy": is_buy}
-                self.save_state()
-                # Wipe cache on successful trade to force fresh balance check next time
-                self.last_summary_time = 0 
-            else:
-                logging.error(f"NADO REJECTED: {getattr(res, 'message', str(res))}")
+                self.save_state(); self.last_summary_time = 0
+            else: logging.error(f"NADO REJECTED: {getattr(res, 'message', str(res))}")
         except Exception as e: logging.error(f"Failure: {e}")
 
     async def run(self):
         self.running = True; self.session = aiohttp.ClientSession()
+        # LAUNCH EVERYTHING AT ONCE
         asyncio.create_task(self.sync_market_data())
+        asyncio.create_task(self.hl_mids_loop())
         asyncio.create_task(self.orderly_mids_loop())
         asyncio.create_task(self.leaderboard_loop())
-        asyncio.create_task(self.sync_nado_memory()) 
+        asyncio.create_task(self.heartbeat())
         await self.process_loop()
 
     async def close(self):
