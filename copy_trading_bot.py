@@ -21,12 +21,11 @@ warnings.filterwarnings("ignore", category=UserWarning, module="eth_utils")
 load_dotenv("/root/hl-copybot/.env")
 NADO_PK = os.getenv("PRIVATE_KEY")
 NADO_OWNER_ADDR = os.getenv("SUBACCOUNT_OWNER")
-# Nado Mainnet (Built on Ink)
 NADO_ENV = NadoClientMode.MAINNET 
 
 TOP_X_TRADERS = 10
 ALLOWED_COINS = {"BTC", "ETH", "SOL", "BNB", "HYPE", "PAX", "WTI"}
-RISK_POS_PCT = 0.10        # 10% of available margin per trade
+RISK_POS_PCT = 0.10        
 MIN_ORDER_USD = 11.0       
 
 # Logging Setup
@@ -41,14 +40,12 @@ logging.basicConfig(
 class NadoQuantBot:
     def __init__(self):
         logging.info("--- INITIALIZING NADO QUANT ENGINE (INK MAINNET) ---")
-        
         try:
             self.signer = Account.from_key(NADO_PK)
             self.owner = self.signer.address
-            logging.info(f"[AUTH] Signer active for address: {self.owner}")
+            logging.info(f"[AUTH] Signer active: {self.owner}")
         except Exception as e:
-            logging.error(f"[AUTH] CRITICAL: Private Key error: {e}")
-            sys.exit(1)
+            logging.error(f"[AUTH] Private Key error: {e}"); sys.exit(1)
 
         self.client = create_nado_client(NADO_ENV, self.signer)
         self.subaccount_hex = subaccount_to_hex(NADO_OWNER_ADDR or self.owner, "default")
@@ -57,7 +54,6 @@ class NadoQuantBot:
         self.tracked_traders = set()
         self.trader_positions = {}
         self.trader_ws_tasks = {}
-        
         self.state_file = "nado_bot_state.json"
         self.bot_state = {"positions": {}}
         self.load_state()
@@ -65,392 +61,212 @@ class NadoQuantBot:
         self.signal_queue = asyncio.Queue()
         self.running = False
         self.product_map = {}
-        self.locked_coins = set() # Prevents duplicate opening trades via concurrent signals
+        self.locked_coins = set()
 
     def load_state(self):
         if os.path.exists(self.state_file):
             try:
-                with open(self.state_file, "r") as f:
-                    self.bot_state = json.load(f)
-                logging.info(f"[MEMORY] Recovered {len(self.bot_state.get('positions', {}))} mirrors.")
-            except Exception as e: 
-                logging.error(f"[MEMORY] State load error, starting fresh: {e}")
-                self.bot_state = {"positions": {}}
+                with open(self.state_file, "r") as f: self.bot_state = json.load(f)
+                logging.info(f"[MEMORY] Recovered {len(self.bot_state.get('positions', {}))} positions.")
+            except: self.bot_state = {"positions": {}}
 
     def save_state(self):
         try:
-            with open(self.state_file, "w") as f:
-                json.dump(self.bot_state, f, indent=4)
-        except Exception as e:
-            logging.error(f"[MEMORY] Failed to save state: {e}")
+            with open(self.state_file, "w") as f: json.dump(self.bot_state, f, indent=4)
+        except Exception as e: logging.error(f"[MEMORY] Save error: {e}")
 
     async def sync_market_data(self):
+        """DEEP SEARCH VERSION: Aggressively finds symbols in nested Nado objects."""
         while self.running:
             try:
                 logging.info("[SYNC] Fetching Perpetual IDs and Ticks from Nado...")
                 res = await asyncio.to_thread(self.client.context.engine_client.get_all_products)
                 
-                # ==========================================
-                # 1. BRUTE-FORCE SDK REFLECTION (AUTODISCOVERY)
-                # ==========================================
-                perps =[]
+                perps = []
+                for attr in ['perp_products', 'products', 'data', 'universe']:
+                    val = getattr(res, attr, None)
+                    if isinstance(val, list) and len(val) > 0:
+                        perps = val; break
                 
-                # If the response is already a list, use it
-                if isinstance(res, list):
-                    perps = res
-                # If it's a dict, search its values for lists
-                elif isinstance(res, dict):
-                    for k, v in res.items():
-                        if isinstance(v, list) and len(v) > 0:
-                            logging.info(f"[SYNC] 🔍 Found products list in dict key: '{k}'")
-                            perps = v
-                            break
-                # If it's an Object (AllProductsData), search its attributes for lists
-                else:
-                    for attr in dir(res):
-                        if not attr.startswith('_'):
-                            try:
-                                val = getattr(res, attr)
-                                if isinstance(val, list) and len(val) > 0:
-                                    logging.info(f"[SYNC] 🔍 Found products list in object attribute: '{attr}'")
-                                    perps = val
-                                    break
-                            except Exception: pass
-                
-                # If we STILL haven't found a list, print the entire object structure to the console
                 if not perps:
-                    logging.warning(f"[SYNC] 🚨 FATAL: Could not find any list of products in the API response.")
-                    logging.warning(f"[SYNC] 🚨 SDK Object Type: {type(res)}")
-                    
-                    if hasattr(res, '__dict__'):
-                        logging.warning(f"[SYNC] 🚨 SDK Object Content: {vars(res)}")
-                    else:
-                        for attr in dir(res):
-                            if not attr.startswith('_'):
-                                try:
-                                    val = getattr(res, attr)
-                                    logging.warning(f"  -> {attr}: {type(val)} = {str(val)[:150]}")
-                                except Exception: pass
-                                
-                    await asyncio.sleep(10)
-                    continue  # Retry loop
-                
-                # ==========================================
-                # 2. PRODUCT PARSING & FILTERING
-                # ==========================================
+                    logging.warning(f"[SYNC] No product list found in {type(res)}"); await asyncio.sleep(10); continue
+
+                logging.info(f"[SYNC] Deep-scanning {len(perps)} products...")
                 count = 0
-                seen_symbols =[]
-                
-                # Log the structure of the first product to help debug if needed
-                first_product = perps[0]
-                logging.info(f"[SYNC] Discovered {len(perps)} total assets in Nado engine.")
-                
+                seen_symbols = []
+
                 for p in perps:
-                    # Dynamically extract fields whether the item is a Dict or Object
-                    if isinstance(p, dict):
-                        symbol = str(p.get('symbol', p.get('name', p.get('coin', '')))).upper()
-                        pid = p.get('product_id', p.get('id', p.get('productId')))
-                        p_tick = p.get('price_increment_x18', p.get('priceIncrementX18', p.get('szDecimals', 0)))
-                        s_tick = p.get('base_tick_x18', p.get('baseTickX18', 0))
-                        m_size = p.get('min_size', p.get('minSize', 0))
-                    else:
-                        symbol = str(getattr(p, 'symbol', getattr(p, 'name', getattr(p, 'coin', '')))).upper()
-                        pid = getattr(p, 'product_id', getattr(p, 'id', getattr(p, 'productId', None)))
-                        p_tick = getattr(p, 'price_increment_x18', getattr(p, 'priceIncrementX18', getattr(p, 'szDecimals', 0)))
-                        s_tick = getattr(p, 'base_tick_x18', getattr(p, 'baseTickX18', getattr(p, 'stepSize', 0)))
-                        m_size = getattr(p, 'min_size', getattr(p, 'minSize', 0))
-
-                    if symbol:
-                        seen_symbols.append(symbol)
-                        
-                    # Forgiving coin matching (removes -PERP, /USD, etc.)
-                    coin = symbol.replace('-PERP', '').replace('/USD', '').replace('PERP', '').replace('-USDT', '')
+                    # 1. DEEP ATTRIBUTE SEARCH
+                    symbol = ""
+                    # Check top level
+                    symbol = getattr(p, 'symbol', getattr(p, 'name', ""))
+                    # Check 'book_info' (Common in Nado/HL SDKs)
+                    if not symbol and hasattr(p, 'book_info'):
+                        symbol = getattr(p.book_info, 'symbol', getattr(p.book_info, 'name', ""))
+                    # Check 'Config' (Seen in your console log)
+                    if not symbol and hasattr(p, 'Config'):
+                        symbol = getattr(p.Config, 'symbol', getattr(p.Config, 'name', ""))
                     
-                    if coin in ALLOWED_COINS:
-                        try:
-                            # Strict fallback for missing precision rules to prevent division by zero
-                            if not p_tick or float(p_tick) == 0: p_tick = "100000000000000"  # Fallback to standard tick
-                            if not s_tick or float(s_tick) == 0: s_tick = "1000000000000000" 
-                            if pid is None:
-                                logging.warning(f"[SYNC] Skipping {coin} because product_id is None.")
-                                continue
-
-                            self.product_map[coin] = {
-                                "id": int(pid), 
-                                "p_tick_x18": Decimal(str(p_tick)), 
-                                "s_tick_x18": Decimal(str(s_tick)),
-                                "min_usd": float(Decimal(str(m_size) if m_size else "0") / Decimal("1e18"))
-                            }
-                            count += 1
-                        except Exception as parse_err:
-                            logging.error(f"[SYNC] Failed to parse math for {coin}: {parse_err}")
-                        
-                if count > 0:
-                    logging.info(f"[SYNC] Success: {count} Nado assets strictly mapped.")
-                    logging.info(f"[SYNC] Mapped assets: {list(self.product_map.keys())}")
-                    return True  # This successfully breaks the while loop!
-                else:
-                    logging.warning(f"[SYNC] 🚨 NO ALLOWED COINS MATCHED!")
-                    logging.warning(f"[SYNC] We are looking for: {ALLOWED_COINS}")
-                    logging.warning(f"[SYNC] The API returned these {len(seen_symbols)} symbols: {seen_symbols[:30]}...")
+                    # Convert to string and clean
+                    symbol = str(symbol).upper()
+                    if symbol: seen_symbols.append(symbol)
                     
-                    # Print exact attribute names of the first item to debug missing fields
-                    if isinstance(first_product, dict):
-                        logging.warning(f"[SYNC] Object structure: {list(first_product.keys())}")
-                    else:
-                        logging.warning(f"[SYNC] Object structure: {[attr for attr in dir(first_product) if not attr.startswith('_')]}")
-                        
-            except Exception as e:
-                logging.error(f"[SYNC] Error: {e}")
+                    coin = symbol.replace('-PERP', '').replace('/USD', '').replace('PERP', '')
+                    pid = getattr(p, 'product_id', None)
+
+                    if coin in ALLOWED_COINS and pid is not None:
+                        # Extract ticks with fallbacks
+                        p_tick = getattr(p, 'price_increment_x18', getattr(getattr(p, 'Config', object()), 'price_increment_x18', "100000000000000"))
+                        s_tick = getattr(p, 'base_tick_x18', getattr(getattr(p, 'Config', object()), 'base_tick_x18', "1000000000000000"))
+                        m_size = getattr(p, 'min_size', 0)
+
+                        self.product_map[coin] = {
+                            "id": int(pid), 
+                            "p_tick_x18": Decimal(str(p_tick)), 
+                            "s_tick_x18": Decimal(str(s_tick)),
+                            "min_usd": float(Decimal(str(m_size)) / Decimal("1e18")) if m_size else 0.0
+                        }
+                        count += 1
                 
+                if count > 0:
+                    logging.info(f"[SYNC] Success: {count} coins mapped: {list(self.product_map.keys())}")
+                    return True
+                else:
+                    logging.warning(f"[SYNC] No matches. First product Deep Dump: {vars(perps[0]) if hasattr(perps[0], '__dict__') else 'No __dict__'}")
+                    logging.warning(f"[SYNC] Symbols detected: {seen_symbols[:15]}")
+                        
+            except Exception as e: logging.error(f"[SYNC] Error: {e}")
             await asyncio.sleep(10)
-
-    def _extract_traders(self, obj, container):
-        if isinstance(obj, dict):
-            u = obj.get("account") or obj.get("user") or obj.get("ethAddress") or obj.get("address")
-            if u and isinstance(u, str) and u.startswith("0x") and len(u) > 30: 
-                container.append(obj)
-            for v in obj.values(): 
-                self._extract_traders(v, container)
-        elif isinstance(obj, list):
-            for i in obj: 
-                self._extract_traders(i, container)
 
     async def leaderboard_loop(self):
         while self.running:
             try:
-                logging.info("[LEADERBOARD] Scanning for top performers...")
+                logging.info("[LEADERBOARD] Fetching Hyperliquid whales...")
                 async with self.session.get("https://stats-data.hyperliquid.xyz/Mainnet/leaderboard") as r:
                     if r.status == 200:
                         data = await r.json()
-                        raw =[]
-                        self._extract_traders(data, raw)
-                        
+                        raw = []; self._extract_traders(data, raw)
                         processed = {}
                         for t in raw:
                             addr = t.get("account") or t.get("user")
                             if addr:
-                                roi_val = t.get("roiWeek")
-                                if roi_val is None: roi_val = t.get("roi")
-                                if roi_val is None: roi_val = 0
-                                
-                                try: processed[addr] = float(roi_val)
-                                except (ValueError, TypeError): processed[addr] = 0.0
-                                    
+                                val = t.get("roiWeek") or t.get("roi") or 0
+                                processed[addr] = float(val)
+                        
                         ranked = sorted(processed.items(), key=lambda x: x[1], reverse=True)
                         top_selected = {r[0] for r in ranked[:TOP_X_TRADERS]}
+                        for p in self.bot_state["positions"].values(): top_selected.add(p["trader"])
                         
-                        # Never un-track a trader we currently hold an open mirrored position for
-                        for p in self.bot_state["positions"].values(): 
-                            top_selected.add(p["trader"])
-                            
                         new = top_selected - self.tracked_traders
                         old = self.tracked_traders - top_selected
                         self.tracked_traders = top_selected
-                        
-                        for t in new: 
-                            self.trader_ws_tasks[t] = asyncio.create_task(self.trader_ws_loop(t))
+                        for t in new: self.trader_ws_tasks[t] = asyncio.create_task(self.trader_ws_loop(t))
                         for t in old:
-                            if t in self.trader_ws_tasks: 
-                                self.trader_ws_tasks[t].cancel()
-                                del self.trader_ws_tasks[t]
-                                
-                        logging.info(f"[TRACKER] Monitoring {len(self.tracked_traders)} Pro Traders.")
-            except Exception: pass 
+                            if t in self.trader_ws_tasks: self.trader_ws_tasks[t].cancel(); del self.trader_ws_tasks[t]
+                        logging.info(f"[TRACKER] Monitoring {len(self.tracked_traders)} traders.")
+            except: pass 
             await asyncio.sleep(300)
+
+    def _extract_traders(self, obj, container):
+        if isinstance(obj, dict):
+            u = obj.get("account") or obj.get("user")
+            if u and isinstance(u, str) and u.startswith("0x") and len(u) > 30: container.append(obj)
+            for v in obj.values(): self._extract_traders(v, container)
+        elif isinstance(obj, list):
+            for i in obj: self._extract_traders(i, container)
 
     async def trader_ws_loop(self, trader: str):
         uri = "wss://api.hyperliquid.xyz/ws"
         while self.running and trader in self.tracked_traders:
             try:
-                # Included both RFC standard pings and Hyperliquid specific application-level pings
-                async with websockets.connect(uri, ping_interval=20, ping_timeout=20) as ws:
+                async with websockets.connect(uri, ping_interval=20) as ws:
                     await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "webData2", "user": trader}}))
-                    
-                    async def ping_loop():
-                        while self.running and not ws.closed:
-                            try:
-                                await ws.send(json.dumps({"method": "ping"}))
-                                await asyncio.sleep(50)
-                            except asyncio.CancelledError: break
-                            except Exception: break
-                                
-                    ping_task = asyncio.create_task(ping_loop())
-                    
+                    async def pinger():
+                        while not ws.closed: await ws.send(json.dumps({"method": "ping"})); await asyncio.sleep(50)
+                    p_task = asyncio.create_task(pinger())
                     try:
                         async for msg in ws:
-                            if not self.running: break
-                            data = json.loads(msg)
-                            if data.get("channel") == "webData2":
-                                data["trader_address"] = trader
-                                await self.signal_queue.put(data)
-                    finally:
-                        ping_task.cancel()
-            except asyncio.CancelledError:
-                break # Task gracefully cancelled
-            except Exception:
-                if self.running: await asyncio.sleep(5)
-
-    async def handle_signal(self, coin: str, old_dir: int, new_dir: int, trader: str):
-        try:
-            # Step 1: Execute close if we currently mirror THIS trader on THIS coin.
-            if coin in self.bot_state["positions"]:
-                if self.bot_state["positions"][coin]["trader"] == trader:
-                    logging.info(f"[SIGNAL] {trader[:6]} closing/flipping {coin}...")
-                    await self.execute_nado_order(coin, is_buy=False, trader=trader, is_close=True)
-                elif old_dir != 0:
-                    return # Ignored: Trader closed a position, but we are mirroring this asset from someone else.
-                    
-            # Step 2: Open logically if they establish a new direction
-            if new_dir != 0:
-                if coin not in self.bot_state["positions"] and coin not in self.locked_coins:
-                    self.locked_coins.add(coin) # Concurrency protection lock
-                    try:
-                        is_buy = (new_dir == 1)
-                        logging.info(f"[SIGNAL] {trader[:6]} opening {coin} ({'LONG' if is_buy else 'SHORT'})...")
-                        await self.execute_nado_order(coin, is_buy=is_buy, trader=trader, is_close=False)
-                    finally:
-                        self.locked_coins.discard(coin)
-        except Exception as e:
-            logging.error(f"[PROCESS] Error handling signal for {coin}: {e}")
+                            d = json.loads(msg)
+                            if d.get("channel") == "webData2":
+                                d["trader_address"] = trader; await self.signal_queue.put(d)
+                    finally: p_task.cancel()
+            except: await asyncio.sleep(5)
 
     async def process_loop(self):
         while self.running:
             data = await self.signal_queue.get()
             try:
                 trader = data.get("trader_address")
-                raw_pos = data.get("data", {}).get("clearinghouseState", {}).get("assetPositions",[])
-                
+                raw_pos = data.get("data", {}).get("clearinghouseState", {}).get("assetPositions", [])
                 new_state = {p["position"]["coin"]: float(p["position"]["szi"]) for p in raw_pos if float(p["position"]["szi"]) != 0}
                 old_state = self.trader_positions.get(trader, {})
-                
                 for coin in ALLOWED_COINS:
-                    old_szi = old_state.get(coin, 0.0)
-                    new_szi = new_state.get(coin, 0.0)
-                    
-                    old_dir = 1 if old_szi > 0 else (-1 if old_szi < 0 else 0)
-                    new_dir = 1 if new_szi > 0 else (-1 if new_szi < 0 else 0)
-                    
-                    # Dispatch as an async task to prevent queue blocking and slippage
-                    if old_dir != new_dir:
-                        asyncio.create_task(self.handle_signal(coin, old_dir, new_dir, trader))
-                        
+                    o_dir = 1 if old_state.get(coin,0)>0 else (-1 if old_state.get(coin,0)<0 else 0)
+                    n_dir = 1 if new_state.get(coin,0)>0 else (-1 if new_state.get(coin,0)<0 else 0)
+                    if o_dir != n_dir: asyncio.create_task(self.handle_signal(coin, o_dir, n_dir, trader))
                 self.trader_positions[trader] = new_state
-            except Exception as e:
-                logging.error(f"[PROCESS] Loop error: {e}")
-            finally: 
-                self.signal_queue.task_done()
+            finally: self.signal_queue.task_done()
 
-    async def execute_nado_order(self, coin: str, is_buy: bool, trader: str, is_close: bool):
-        market = self.product_map.get(coin.upper())
-        if not market: 
-            logging.warning(f"[EXEC] Skip {coin}: Rules not yet synced from Nado."); return
+    async def handle_signal(self, coin, o_dir, n_dir, trader):
+        if coin in self.bot_state["positions"] and self.bot_state["positions"][coin]["trader"] == trader:
+            await self.execute_nado_order(coin, False, trader, True)
+        if n_dir != 0 and coin not in self.bot_state["positions"]:
+            if coin not in self.locked_coins:
+                self.locked_coins.add(coin)
+                try: await self.execute_nado_order(coin, n_dir==1, trader, False)
+                finally: self.locked_coins.discard(coin)
 
+    async def execute_nado_order(self, coin, is_buy, trader, is_close):
+        market = self.product_map.get(coin)
+        if not market: return
         try:
-            price_res = await asyncio.to_thread(self.client.perp.get_prices, market["id"])
-            mark_px_x18 = int(getattr(price_res, 'mark_price_x18', 0))
-            if mark_px_x18 == 0:
-                logging.error(f"[PRICE] Could not fetch mark price for {coin}"); return
+            p_res = await asyncio.to_thread(self.client.perp.get_prices, market["id"])
+            mark_x18 = int(getattr(p_res, 'mark_price_x18', 0))
+            if mark_x18 == 0: return
             
-            px_float = float(mark_px_x18) / 1e18
-
             if is_close:
-                pos_data = self.bot_state["positions"].get(coin)
-                if not pos_data or pos_data["trader"] != trader: return 
-                
-                is_buy = not pos_data["is_buy"]
-                target_px_x18 = Decimal(str(mark_px_x18)) * Decimal("1.10" if is_buy else "0.90")
-                final_px_x18 = (target_px_x18 / market["p_tick_x18"]).quantize(Decimal('1'), rounding=ROUND_DOWN) * market["p_tick_x18"]
-                
-                # Uses identical qty_x18 logged from opening the trade so there are zero orphaned decimal dustings
-                qty_x18 = pos_data.get("qty_x18")
-                
-                if not qty_x18: # Fallback backwards compatibility
-                    sub_info = await asyncio.to_thread(self.client.context.engine_client.get_subaccount_info, self.subaccount_hex)
-                    iso_res = await asyncio.to_thread(self.client.context.engine_client.get_isolated_positions, self.subaccount_hex)
-                    manager = MarginManager(sub_info, getattr(iso_res, 'isolated_positions',[]))
-                    summary = manager.calculate_account_summary()
-                    available = float(summary.funds_available)
-                    usd_amt = max(available * RISK_POS_PCT, MIN_ORDER_USD, market["min_usd"])
-                    qty_x18 = (Decimal(str(usd_amt)) * Decimal("1e18") / Decimal(str(px_float)) / market["s_tick_x18"]).quantize(Decimal('1'), rounding=ROUND_DOWN) * market["s_tick_x18"]
-                
-                qty_x18 = int(qty_x18)
+                pos = self.bot_state["positions"].get(coin)
+                if not pos: return
+                is_buy = not pos["is_buy"]; qty_x18 = pos["qty_x18"]
+                slip = 1.10 if is_buy else 0.90
             else:
-                if coin in self.bot_state["positions"]: return
-
-                target_px_x18 = Decimal(str(mark_px_x18)) * Decimal("1.05" if is_buy else "0.95")
-                final_px_x18 = (target_px_x18 / market["p_tick_x18"]).quantize(Decimal('1'), rounding=ROUND_DOWN) * market["p_tick_x18"]
-                
                 sub_info = await asyncio.to_thread(self.client.context.engine_client.get_subaccount_info, self.subaccount_hex)
                 iso_res = await asyncio.to_thread(self.client.context.engine_client.get_isolated_positions, self.subaccount_hex)
-                manager = MarginManager(sub_info, getattr(iso_res, 'isolated_positions',[]))
-                summary = manager.calculate_account_summary()
-                
-                available = float(summary.funds_available)
-                usd_amt = max(available * RISK_POS_PCT, MIN_ORDER_USD, market["min_usd"])
-                if available < usd_amt:
-                    logging.warning(f"[ACCOUNT] Skip {coin}: Available Margin ${available:.2f} is too low."); return
-                
-                qty_x18 = (Decimal(str(usd_amt)) * Decimal("1e18") / Decimal(str(px_float)) / market["s_tick_x18"]).quantize(Decimal('1'), rounding=ROUND_DOWN) * market["s_tick_x18"]
-                if qty_x18 <= 0:
-                    logging.error(f"[MATH] Quantity for {coin} rounded to zero."); return
-                qty_x18 = int(qty_x18)
+                mgr = MarginManager(sub_info, getattr(iso_res, 'isolated_positions', []))
+                avail = float(mgr.calculate_account_summary().funds_available)
+                usd = max(avail * RISK_POS_PCT, MIN_ORDER_USD, market["min_usd"])
+                if avail < usd: return
+                qty_x18 = int((Decimal(str(usd)) * Decimal("1e18") / (Decimal(str(mark_x18))/Decimal("1e18")) / market["s_tick_x18"]).quantize(Decimal('1'), rounding=ROUND_DOWN) * market["s_tick_x18"])
+                slip = 1.05 if is_buy else 0.95
 
-            sender_params = SubaccountParams(subaccount_owner=NADO_OWNER_ADDR or self.owner, subaccount_name="default")
-            
+            px_x18 = int((Decimal(str(mark_x18)) * Decimal(str(slip)) / market["p_tick_x18"]).quantize(Decimal('1'), rounding=ROUND_DOWN) * market["p_tick_x18"])
             order = OrderParams(
-                sender=sender_params, 
-                priceX18=int(final_px_x18), 
-                amount=int(qty_x18) if is_buy else -int(qty_x18),
-                expiration=get_expiration_timestamp(60), 
-                nonce=gen_order_nonce(),
+                sender=SubaccountParams(subaccount_owner=NADO_OWNER_ADDR or self.owner, subaccount_name="default"),
+                priceX18=px_x18, amount=qty_x18 if is_buy else -qty_x18,
+                expiration=get_expiration_timestamp(60), nonce=gen_order_nonce(),
                 appendix=build_appendix(order_type=OrderType.IOC, reduce_only=is_close)
             )
-
-            logging.info(f"[EXEC] Sending Order: {coin} | Side: {'BUY' if is_buy else 'SELL'} | Px: {px_float:.4f} | Qty (x18): {qty_x18}")
             res = await asyncio.to_thread(self.client.market.place_order, PlaceOrderParams(product_id=market["id"], order=order))
-            
-            # Safe object validation strictly for Nado's response formatting
-            res_str = str(res).lower()
-            if "success" in res_str or "ok" in res_str or "accepted" in res_str or (not getattr(res, 'error', None) and "error" not in res_str):
-                logging.info(f"[SUCCESS] {coin} mirror complete on Nado.")
-                if is_close: 
-                    del self.bot_state["positions"][coin]
-                else: 
-                    self.bot_state["positions"][coin] = {"trader": trader, "is_buy": is_buy, "qty_x18": qty_x18}
-                self.save_state()
-            else:
-                logging.error(f"[FAILED] Nado rejected trade: {getattr(res, 'message', str(res))}")
-
-        except Exception as e: 
-            logging.error(f"[CRITICAL] Execution failure for {coin}: {e}")
+            if "success" in str(res).lower() or "ok" in str(res).lower():
+                if is_close: del self.bot_state["positions"][coin]
+                else: self.bot_state["positions"][coin] = {"trader": trader, "is_buy": is_buy, "qty_x18": qty_x18}
+                self.save_state(); logging.info(f"[SUCCESS] {coin} mirrored.")
+        except Exception as e: logging.error(f"[EXEC] Error: {e}")
 
     async def run(self):
-        self.running = True
-        self.session = aiohttp.ClientSession()
-        await self.sync_market_data()
-        asyncio.create_task(self.leaderboard_loop())
-        await self.process_loop()
+        self.running = True; self.session = aiohttp.ClientSession()
+        if await self.sync_market_data():
+            asyncio.create_task(self.leaderboard_loop())
+            await self.process_loop()
 
-    async def close(self):
-        self.running = False
-        if self.session: await self.session.close()
+    async def close(self): self.running = False; await self.session.close()
 
 async def main():
-    bot = NadoQuantBot()
-    loop = asyncio.get_running_loop()
-    stop = asyncio.Event()
-    
-    # Graceful Mac & Linode Unix compatibility check
-    for sig in (signal.SIGINT, signal.SIGTERM): 
-        try: loop.add_signal_handler(sig, stop.set)
-        except NotImplementedError: pass # Windows silent fallback if tested locally
-        
-    t = asyncio.create_task(bot.run())
-    await stop.wait()
-    logging.info("Shutting down cleanly...")
-    await bot.close()
-    t.cancel()
+    bot = NadoQuantBot(); stop = asyncio.Event(); loop = asyncio.get_running_loop()
+    for s in (signal.SIGINT, signal.SIGTERM): 
+        try: loop.add_signal_handler(s, stop.set)
+        except: pass
+    t = asyncio.create_task(bot.run()); await stop.wait(); await bot.close(); t.cancel()
 
 if __name__ == "__main__":
     try: asyncio.run(main())
