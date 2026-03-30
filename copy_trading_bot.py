@@ -24,7 +24,6 @@ NADO_OWNER_ADDR = os.getenv("SUBACCOUNT_OWNER")
 NADO_ENV = NadoClientMode.MAINNET 
 
 TOP_X_TRADERS = 10
-# The bot will auto-detect these based on Price + ID
 ALLOWED_COINS = {"BTC", "ETH", "SOL", "BNB", "HYPE", "PAX", "WTI"}
 RISK_POS_PCT = 0.10        
 MIN_ORDER_USD = 11.0       
@@ -82,7 +81,6 @@ class NadoQuantBot:
             try:
                 logging.info("[SYNC] Connecting to Nado Engine...")
                 res = await asyncio.to_thread(self.client.context.engine_client.get_all_products)
-                
                 perps = getattr(res, 'perp_products', [])
                 if not perps:
                     logging.warning("[SYNC] Engine returned no products. Retrying..."); await asyncio.sleep(10); continue
@@ -94,27 +92,20 @@ class NadoQuantBot:
                     px = float(price_x18) / 1e18
                     
                     coin = None
-                    # Logical Price Detection (Universal for all Crypto Markets)
                     if px > 30000: coin = "BTC"
                     elif 1500 < px < 6000: coin = "ETH"
-                    elif 50 < px < 350: 
-                        # Distinguish SOL vs BNB by ID if possible (SOL usually ID 4, BNB ID 5)
-                        coin = "SOL" if pid == 4 else "BNB"
-                    elif 1.0 < px < 30.0:
-                        if pid == 1: coin = "HYPE"
-                        else: coin = "PAX"
-                    elif 50.0 < px < 150.0: coin = "WTI"
+                    elif 50 < px < 400: coin = "SOL" if pid == 4 else "BNB"
+                    elif 1.0 < px < 30.0: coin = "HYPE" if pid == 1 else "PAX"
+                    elif 40.0 < px < 150.0: coin = "WTI"
 
                     if coin and coin in ALLOWED_COINS:
                         b_info = getattr(p, 'book_info', None)
-                        # Official Nado Ticks (from your console dump)
                         p_tick = getattr(b_info, 'price_increment_x18', "100000000000000")
                         s_tick = getattr(b_info, 'size_increment', "1000000000000000")
                         m_size = getattr(b_info, 'min_size', 0)
 
                         self.product_map[coin] = {
-                            "id": int(pid), 
-                            "p_tick_x18": Decimal(str(p_tick)), 
+                            "id": int(pid), "p_tick_x18": Decimal(str(p_tick)), 
                             "s_tick_x18": Decimal(str(s_tick)),
                             "min_usd": float(Decimal(str(m_size)) / Decimal("1e18")) if m_size else 0.0
                         }
@@ -123,45 +114,52 @@ class NadoQuantBot:
                 if count > 0:
                     logging.info(f"[SYNC] Success: {count} assets auto-detected: {list(self.product_map.keys())}")
                     return True
-                else:
-                    logging.warning("[SYNC] Detection failed. Retrying in 10s...")
-                        
-            except Exception as e: logging.error(f"[SYNC] Critical Error: {e}")
+            except Exception as e: logging.error(f"[SYNC] Error: {e}")
             await asyncio.sleep(10)
 
     async def leaderboard_loop(self):
+        headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
         while self.running:
             try:
                 logging.info("[LEADERBOARD] Fetching Hyperliquid whales...")
-                async with self.session.get("https://stats-data.hyperliquid.xyz/Mainnet/leaderboard") as r:
+                async with self.session.get("https://stats-data.hyperliquid.xyz/Mainnet/leaderboard", headers=headers) as r:
                     if r.status == 200:
                         data = await r.json()
                         raw = []; self._extract_traders(data, raw)
+                        
                         processed = {}
                         for t in raw:
-                            addr = t.get("account") or t.get("user")
+                            # HL often switches keys between ethAddress, account, and user
+                            addr = t.get("ethAddress") or t.get("account") or t.get("user")
                             if addr:
                                 val = t.get("roiWeek") or t.get("roi") or 0
-                                processed[addr] = float(val)
+                                try: processed[addr] = float(val)
+                                except: processed[addr] = 0.0
                         
                         ranked = sorted(processed.items(), key=lambda x: x[1], reverse=True)
                         top_selected = {r[0] for r in ranked[:TOP_X_TRADERS]}
+                        
                         for p in self.bot_state["positions"].values(): top_selected.add(p["trader"])
                         
                         new = top_selected - self.tracked_traders
                         old = self.tracked_traders - top_selected
                         self.tracked_traders = top_selected
+                        
                         for t in new: self.trader_ws_tasks[t] = asyncio.create_task(self.trader_ws_loop(t))
                         for t in old:
                             if t in self.trader_ws_tasks: self.trader_ws_tasks[t].cancel(); del self.trader_ws_tasks[t]
                         logging.info(f"[TRACKER] Monitoring {len(self.tracked_traders)} traders.")
-            except: pass 
+                    else:
+                        logging.warning(f"[LEADERBOARD] API error: {r.status}")
+            except Exception as e: logging.error(f"[LEADERBOARD] Loop error: {e}")
             await asyncio.sleep(300)
 
     def _extract_traders(self, obj, container):
         if isinstance(obj, dict):
-            u = obj.get("account") or obj.get("user")
-            if u and isinstance(u, str) and u.startswith("0x") and len(u) > 30: container.append(obj)
+            # Greedy search for any key that looks like an address
+            u = obj.get("ethAddress") or obj.get("account") or obj.get("user") or obj.get("address")
+            if u and isinstance(u, str) and u.startswith("0x") and len(u) > 30: 
+                container.append(obj)
             for v in obj.values(): self._extract_traders(v, container)
         elif isinstance(obj, list):
             for i in obj: self._extract_traders(i, container)
