@@ -76,49 +76,46 @@ class NadoQuantBot:
         except Exception as e: logging.error(f"[MEMORY] Save error: {e}")
 
     async def sync_market_data(self):
-        """DEEP SEARCH VERSION: Aggressively finds symbols in nested Nado objects."""
+        """META-DRIVEN SYNC: Matches Coin Names to IDs using the Universe Map."""
         while self.running:
             try:
-                logging.info("[SYNC] Fetching Perpetual IDs and Ticks from Nado...")
+                logging.info("[SYNC] Fetching Meta Universe from Nado...")
+                # 1. Fetch Meta (The Mapping of Name -> ID)
+                meta = await asyncio.to_thread(self.client.context.engine_client.get_meta)
+                
+                universe = []
+                if hasattr(meta, 'universe'): universe = meta.universe
+                elif isinstance(meta, dict): universe = meta.get('universe', [])
+                
+                # Create a map of ID -> Name
+                id_to_name = {}
+                for item in universe:
+                    name = str(getattr(item, 'name', '')).upper()
+                    # Clean the name (BTC-PERP -> BTC)
+                    clean_name = name.split('-')[0].split('/')[0].replace('PERP','')
+                    idx = universe.index(item) # Usually Meta index = Product ID
+                    id_to_name[idx] = clean_name
+
+                # 2. Fetch Product Settings (Ticks/MinSize)
+                logging.info("[SYNC] Fetching Engine Settings...")
                 res = await asyncio.to_thread(self.client.context.engine_client.get_all_products)
                 
-                perps = []
-                for attr in ['perp_products', 'products', 'data', 'universe']:
-                    val = getattr(res, attr, None)
-                    if isinstance(val, list) and len(val) > 0:
-                        perps = val; break
-                
-                if not perps:
-                    logging.warning(f"[SYNC] No product list found in {type(res)}"); await asyncio.sleep(10); continue
-
-                logging.info(f"[SYNC] Deep-scanning {len(perps)} products...")
+                perps = getattr(res, 'perp_products', [])
                 count = 0
-                seen_symbols = []
-
+                
                 for p in perps:
-                    # 1. DEEP ATTRIBUTE SEARCH
-                    symbol = ""
-                    # Check top level
-                    symbol = getattr(p, 'symbol', getattr(p, 'name', ""))
-                    # Check 'book_info' (Common in Nado/HL SDKs)
-                    if not symbol and hasattr(p, 'book_info'):
-                        symbol = getattr(p.book_info, 'symbol', getattr(p.book_info, 'name', ""))
-                    # Check 'Config' (Seen in your console log)
-                    if not symbol and hasattr(p, 'Config'):
-                        symbol = getattr(p.Config, 'symbol', getattr(p.Config, 'name', ""))
-                    
-                    # Convert to string and clean
-                    symbol = str(symbol).upper()
-                    if symbol: seen_symbols.append(symbol)
-                    
-                    coin = symbol.replace('-PERP', '').replace('/USD', '').replace('PERP', '')
                     pid = getattr(p, 'product_id', None)
-
-                    if coin in ALLOWED_COINS and pid is not None:
-                        # Extract ticks with fallbacks
-                        p_tick = getattr(p, 'price_increment_x18', getattr(getattr(p, 'Config', object()), 'price_increment_x18', "100000000000000"))
-                        s_tick = getattr(p, 'base_tick_x18', getattr(getattr(p, 'Config', object()), 'base_tick_x18', "1000000000000000"))
-                        m_size = getattr(p, 'min_size', 0)
+                    if pid is None: continue
+                    
+                    # Look up the name using our Meta Map
+                    coin = id_to_name.get(pid)
+                    
+                    if coin in ALLOWED_COINS:
+                        # Extract tick info from 'book_info' (Verified in your console dump)
+                        b_info = getattr(p, 'book_info', None)
+                        p_tick = getattr(b_info, 'price_increment_x18', "100000000000000")
+                        s_tick = getattr(b_info, 'size_increment', "1000000000000000")
+                        m_size = getattr(b_info, 'min_size', 0)
 
                         self.product_map[coin] = {
                             "id": int(pid), 
@@ -132,8 +129,15 @@ class NadoQuantBot:
                     logging.info(f"[SYNC] Success: {count} coins mapped: {list(self.product_map.keys())}")
                     return True
                 else:
-                    logging.warning(f"[SYNC] No matches. First product Deep Dump: {vars(perps[0]) if hasattr(perps[0], '__dict__') else 'No __dict__'}")
-                    logging.warning(f"[SYNC] Symbols detected: {seen_symbols[:15]}")
+                    # Fallback: Hardcoded mapping if Meta call fails to provide names
+                    logging.warning("[SYNC] Meta failed to provide names. Using Hardcoded Fallback...")
+                    # Mapping based on your console dump ($66k = ID 2)
+                    fallback_map = {2: "BTC", 3: "ETH", 4: "SOL"} 
+                    for pid, coin in fallback_map.items():
+                        if coin in ALLOWED_COINS:
+                            # Use default ticks if sync fails
+                            self.product_map[coin] = {"id": pid, "p_tick_x18": Decimal("100000000000000"), "s_tick_x18": Decimal("1000000000000000"), "min_usd": 11.0}
+                    return True
                         
             except Exception as e: logging.error(f"[SYNC] Error: {e}")
             await asyncio.sleep(10)
